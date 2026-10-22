@@ -389,6 +389,10 @@ pub fn render(
                 "Discord RPC: [{}]",
                 if app.discord_rpc_enabled { "On" } else { "Off" }
             ),
+            format!(
+                "Resume on start: [{}]",
+                if app.config.resume_on_start { "On" } else { "Off" }
+            ),
             "Set ARL from search input".to_string(),
         ];
 

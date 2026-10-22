@@ -1,7 +1,9 @@
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
+use crate::api::HistoryEntry;
 use crate::config::{AudioQuality, Config};
+use crate::state::PlaybackState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -53,6 +55,8 @@ pub enum UiEvent {
         playlists: Vec<(String, String)>,
         artists: Vec<(String, String)>,
     },
+    /// Listening history fetched at startup (empty when unavailable).
+    HistoryLoaded(Vec<HistoryEntry>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +142,9 @@ pub struct App {
     pub cover_art: Option<image::DynamicImage>,
     pub cover_art_png: Option<Vec<u8>>,
     pub cover_art_track_id: Option<String>,
+    /// Snapshot from the previous session, consumed once resume has run.
+    pub saved_state: Option<PlaybackState>,
+    pub resume_done: bool,
 }
 
 impl App {
@@ -194,6 +201,8 @@ impl App {
             cover_art: None,
             cover_art_png: None,
             cover_art_track_id: None,
+            saved_state: None,
+            resume_done: false,
         }
     }
 
@@ -244,7 +253,7 @@ impl App {
             }
             ActivePanel::Main => {
                 if self.viewing_settings {
-                    let max = 4usize;
+                    let max = 5usize;
                     let current = self.settings_state.selected().unwrap_or(0);
                     self.settings_state.select(Some((current + 1).min(max)));
                 } else if self.showing_search_results {

@@ -5,6 +5,7 @@ mod crypto;
 mod discord_rpc;
 mod mpris;
 mod player;
+mod state;
 mod ui;
 
 use std::{
@@ -24,6 +25,8 @@ use anyhow::{anyhow, Context, Result as AnyResult};
 use base64::Engine;
 use app::{ActivePanel, App, Command, NowPlaying, RepeatMode, SearchCategory, UiEvent};
 use config::{AudioQuality, Config, Theme};
+use api::HistoryEntry;
+use state::PlaybackState;
 use discord_rpc::{DiscordPresence, DiscordRpcHandle};
 use crossterm::{
     event::{
@@ -307,7 +310,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_quality = config.default_quality;
     let initial_crossfade_enabled = config.crossfade_enabled;
     let initial_crossfade_duration_ms = config.crossfade_duration_ms;
+    let resume_on_start = config.resume_on_start;
     let mut app = App::new(config, command_sender);
+    if resume_on_start {
+        app.saved_state = state::load_state();
+    } else {
+        app.resume_done = true;
+    }
     let discord_rpc = DiscordRpcHandle::new();
 
     // Spawn task to fetch user playlists on startup
@@ -339,6 +348,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Err(err) => {
                                     let _ = playlists_event_tx.send(UiEvent::Error(format!("API Error fetching playlists: {}", err)));
                                 }
+                            }
+                            if resume_on_start {
+                                // Deezer history is used to decide whether something newer was
+                                // played on another device since the last local snapshot.
+                                let history = client
+                                    .fetch_listening_history(user_id, 10)
+                                    .await
+                                    .unwrap_or_default();
+                                let _ = playlists_event_tx.send(UiEvent::HistoryLoaded(history));
                             }
                         } else {
                             let _ = playlists_event_tx.send(UiEvent::Error("API Error: No user ID".into()));
@@ -410,6 +428,7 @@ async fn run_tui_loop(
 ) -> AnyResult<()> {
     let mut last_tick = Instant::now();
     let mut last_rpc_refresh = Instant::now();
+    let mut last_state_save = Instant::now();
     let mut image_protocol = detect_image_protocol();
     let mut ueberzugpp_layer = match image_protocol {
         ImageProtocol::Ueberzugpp => UeberzugppLayer::start(),
@@ -441,6 +460,15 @@ async fn run_tui_loop(
         if last_rpc_refresh.elapsed() >= Duration::from_secs(5) {
             sync_discord_presence(discord_rpc, app);
             last_rpc_refresh = Instant::now();
+        }
+
+        // Periodic snapshot so a crash or a killed terminal still resumes close
+        // to where playback was.
+        if last_state_save.elapsed() >= Duration::from_secs(10) {
+            if app.now_playing.is_some() {
+                persist_state(app);
+            }
+            last_state_save = Instant::now();
         }
 
         if app.is_playing
@@ -713,6 +741,7 @@ async fn run_tui_loop(
 
                     match key.code {
                         KeyCode::Char('q') => {
+                            persist_state(app);
                             discord_rpc.clear();
                             let _ = app.command_sender.send(Command::Shutdown);
                             break 'ui;
@@ -773,6 +802,18 @@ async fn run_tui_loop(
                                 ActivePanel::PlayerProgress => ActivePanel::Navigation,
                                 ActivePanel::Player => ActivePanel::Navigation,
                                 ActivePanel::PlayerInfo => ActivePanel::Navigation,
+                            };
+                        }
+                        KeyCode::BackTab if !app.is_searching => {
+                            app.active_panel = match app.active_panel {
+                                ActivePanel::Navigation => ActivePanel::Player,
+                                ActivePanel::Playlists => ActivePanel::Navigation,
+                                ActivePanel::Queue => ActivePanel::Playlists,
+                                ActivePanel::Search => ActivePanel::Queue,
+                                ActivePanel::Main => ActivePanel::Search,
+                                ActivePanel::PlayerProgress => ActivePanel::Main,
+                                ActivePanel::Player => ActivePanel::Main,
+                                ActivePanel::PlayerInfo => ActivePanel::Main,
                             };
                         }
                         KeyCode::Down | KeyCode::Char('j') if !app.is_searching => app.handle_down(),
@@ -991,6 +1032,15 @@ async fn run_tui_loop(
                                                     sync_discord_presence(discord_rpc, app);
                                                 }
                                                 4 => {
+                                                    app.config.resume_on_start = !app.config.resume_on_start;
+                                                    let _ = save_config(&app.config);
+                                                    app.status_message = if app.config.resume_on_start {
+                                                        "Resume on start enabled".into()
+                                                    } else {
+                                                        "Resume on start disabled".into()
+                                                    };
+                                                }
+                                                5 => {
                                                     let new_arl = app.search_query.trim();
                                                     if new_arl.is_empty() {
                                                         app.status_message = "Type new ARL in search box first".into();
@@ -1209,6 +1259,9 @@ async fn run_tui_loop(
 
         while let Ok(event) = event_rx.try_recv() {
             match event {
+                UiEvent::HistoryLoaded(history) => {
+                    apply_resume(app, &history);
+                }
                 UiEvent::TrackChanged {
                     id,
                     title,
@@ -2308,6 +2361,130 @@ async fn ensure_verified_arl() -> AnyResult<()> {
             }
         }
     }
+}
+
+/// Snapshot the current player state to disk (no-op when nothing has played).
+fn persist_state(app: &App) {
+    let Some(now) = app.now_playing.as_ref() else { return };
+    let snapshot = PlaybackState::capture(
+        &now.id,
+        &now.title,
+        &now.artist,
+        now.current_ms,
+        now.total_ms,
+        app.is_playing,
+        app.volume,
+        &app.queue_tracks,
+        app.queue_index,
+        app.current_playlist_id.as_deref(),
+    );
+    let _ = state::save_state(&snapshot);
+}
+
+/// Decide what to resume on launch: the local snapshot, or the most recent
+/// Deezer listen when something was played elsewhere after that snapshot.
+/// Runs once, when the startup task reports the listening history.
+fn apply_resume(app: &mut App, history: &[HistoryEntry]) {
+    if app.resume_done {
+        return;
+    }
+    app.resume_done = true;
+
+    // Don't interrupt anything the user already started by hand.
+    if app.now_playing.is_some() {
+        return;
+    }
+
+    let local = app.saved_state.take();
+    let remote = history.first();
+
+    // Deezer only reports plays from other clients (this TUI does not log
+    // listens), so a remote timestamp newer than the snapshot means the user
+    // moved on elsewhere. A small margin absorbs clock skew.
+    let remote_is_newer = match (&local, remote) {
+        (Some(local), Some(remote)) => remote.ts > local.saved_at.saturating_add(30),
+        (None, Some(_)) => true,
+        (_, None) => false,
+    };
+
+    let quality = app.config.default_quality;
+
+    if remote_is_newer {
+        let remote = remote.expect("checked above");
+        app.queue_tracks = vec![(remote.id.clone(), remote.title.clone(), remote.artist.clone())];
+        app.queue = vec![format!("{} - {}", remote.title, remote.artist)];
+        app.queue_index = Some(0);
+        app.queue_state.select(Some(0));
+        if let Some(local) = local.as_ref() {
+            app.volume = local.volume.min(100);
+            let _ = app.command_sender.send(Command::SetVolume(app.volume));
+        }
+        let _ = app.command_sender.send(Command::PlayTrackAt {
+            track_id: remote.id.clone(),
+            quality,
+            seek_ms: 0,
+        });
+        // Position is unknown for plays made elsewhere: start paused at 0.
+        let _ = app.command_sender.send(Command::Pause);
+        app.status_message = format!("Resumed from Deezer: {} - {} (p to play)", remote.title, remote.artist);
+        return;
+    }
+
+    let Some(local) = local else { return };
+
+    app.volume = local.volume.min(100);
+    let _ = app.command_sender.send(Command::SetVolume(app.volume));
+
+    if !local.queue_tracks.is_empty() {
+        app.queue = local
+            .queue_tracks
+            .iter()
+            .map(|(_, title, artist)| format!("{} - {}", title, artist))
+            .collect();
+        app.queue_tracks = local.queue_tracks.clone();
+        let idx = local
+            .queue_index
+            .filter(|i| *i < app.queue_tracks.len())
+            .or_else(|| app.queue_tracks.iter().position(|(id, _, _)| *id == local.track_id));
+        app.queue_index = idx;
+        app.queue_state.select(idx);
+    } else {
+        app.queue_tracks = vec![(local.track_id.clone(), local.title.clone(), local.artist.clone())];
+        app.queue = vec![format!("{} - {}", local.title, local.artist)];
+        app.queue_index = Some(0);
+        app.queue_state.select(Some(0));
+    }
+
+    // Re-open the view the track was launched from so the main panel matches.
+    if let Some(source) = local.current_playlist_id.as_deref() {
+        let cmd = match source {
+            "__home__" => Some(Command::LoadHome),
+            "__explore__" => Some(Command::LoadExplore),
+            id if !id.is_empty() => Some(Command::LoadPlaylist(id.to_owned())),
+            _ => None,
+        };
+        if let Some(cmd) = cmd {
+            app.current_playlist_id = Some(source.to_owned());
+            let _ = app.command_sender.send(cmd);
+        }
+    }
+
+    let _ = app.command_sender.send(Command::PlayTrackAt {
+        track_id: local.track_id.clone(),
+        quality,
+        seek_ms: local.position_ms,
+    });
+    if !local.was_playing {
+        let _ = app.command_sender.send(Command::Pause);
+    }
+    app.status_message = format!(
+        "Resumed: {} - {} at {}:{:02}{}",
+        local.title,
+        local.artist,
+        local.position_ms / 60_000,
+        (local.position_ms / 1000) % 60,
+        if local.was_playing { "" } else { " (paused, p to play)" }
+    );
 }
 
 fn config_file_path() -> AnyResult<PathBuf> {

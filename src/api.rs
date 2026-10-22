@@ -20,6 +20,16 @@ pub struct DeezerClient {
     loved_tracks_id: Option<String>,
 }
 
+/// One entry of the user's Deezer listening history (most recent first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    /// Unix timestamp (seconds) of the listen, as reported by Deezer.
+    pub ts: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrackMetadata {
     pub id: String,
@@ -386,6 +396,69 @@ impl DeezerClient {
             .context("failed to decode Deezer gateway response")?;
 
         Ok((response, text))
+    }
+
+    /// Fetch the account's listening history ("Just heard"), most recent first.
+    /// Deezer only reports which tracks were played and when, not the position.
+    pub async fn fetch_listening_history(&self, user_id: &str, nb: usize) -> Result<Vec<HistoryEntry>> {
+        let api_token = self
+            .api_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("api token not loaded; call fetch_api_token first"))?;
+        let effective_user_id = self.user_id.as_deref().unwrap_or(user_id);
+        let profile_id = effective_user_id.parse::<u64>().unwrap_or(0);
+        let payload = json!({
+            "profile_id": profile_id,
+            "user_id": profile_id,
+            "USER_ID": profile_id,
+            "tab": "history",
+            "nb": nb
+        });
+
+        let json = self
+            .http
+            .post(format!(
+                "{GATEWAY_URL}?method=deezer.pageProfile&api_version=1.0&api_token={api_token}"
+            ))
+            .query(&[("input", "3")])
+            .header(
+                reqwest::header::COOKIE,
+                format!("arl={}; sid={}", self.arl, self.session_id),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()
+            .context("gateway returned error for deezer.pageProfile (history)")?
+            .json::<Value>()
+            .await
+            .context("failed to decode history response")?;
+
+        if let Some(err) = json.get("error").filter(|e| e.is_object() && !e.as_object().unwrap().is_empty()) {
+            return Err(anyhow!("gateway error for history: {err}"));
+        }
+
+        let entries = json["results"]["TAB"]["history"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let id = item["SNG_ID"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| item["SNG_ID"].as_i64().map(|n| n.to_string()))?;
+                let title = item["SNG_TITLE"].as_str()?.to_owned();
+                let artist = item["ART_NAME"].as_str().unwrap_or("Unknown artist").to_owned();
+                let ts = item["TS"]
+                    .as_u64()
+                    .or_else(|| item["TS"].as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(0);
+                Some(HistoryEntry { id, title, artist, ts })
+            })
+            .collect();
+
+        Ok(entries)
     }
 
     pub async fn fetch_user_playlists(&self, user_id: &str) -> Result<Vec<(String, String)>> {

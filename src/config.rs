@@ -43,6 +43,13 @@ pub struct Config {
     pub discord_rpc_enabled: bool,
     #[serde(default)]
     pub arl: String,
+    /// Restore the last track / queue (local snapshot or Deezer history) on launch.
+    #[serde(default = "default_true")]
+    pub resume_on_start: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -54,6 +61,7 @@ impl Default for Config {
             default_quality: AudioQuality::Kbps320,
             discord_rpc_enabled: false,
             arl: String::new(),
+            resume_on_start: true,
         }
     }
 }
