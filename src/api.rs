@@ -823,7 +823,23 @@ impl DeezerClient {
         Ok(entries)
     }
 
-    pub async fn fetch_user_playlists(&self, user_id: &str) -> Result<Vec<(String, String)>> {
+    /// Add one track to a playlist the user owns (gateway `playlist.addSongs`).
+    pub async fn add_track_to_playlist(&self, playlist_id: &str, track_id: &str) -> Result<()> {
+        let json = self
+            .gw_post(
+                "playlist.addSongs",
+                json!({ "playlist_id": playlist_id, "songs": [[track_id, 0]], "offset": -1 }),
+            )
+            .await?;
+        if json["results"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(anyhow!("Deezer refused the addition: {}", json["results"]))
+        }
+    }
+
+    /// (id, title, owned by the user) for every playlist in the library.
+    pub async fn fetch_user_playlists(&self, user_id: &str) -> Result<Vec<(String, String, bool)>> {
         let api_token = self
             .api_token
             .as_deref()
@@ -882,7 +898,8 @@ impl DeezerClient {
                     .as_str()
                     .or(item["title"].as_str())?
                     .to_owned();
-                Some((id, title))
+                let own = str_or_num(&item["PARENT_USER_ID"]).as_deref() == Some(effective_user_id);
+                Some((id, title, own))
             })
             .collect();
 
@@ -1204,7 +1221,7 @@ impl DeezerClient {
 
         if let Some(user_id) = self.user_id() {
             if let Ok(playlists) = self.fetch_user_playlists(user_id).await {
-                for (playlist_id, _) in playlists.into_iter().take(8) {
+                for (playlist_id, _, _) in playlists.into_iter().take(8) {
                     if out.len() >= 120 {
                         break;
                     }

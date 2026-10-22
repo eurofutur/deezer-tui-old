@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{fmt_count, fmt_duration, ActivePanel, App, ArtistRow, ArtistTab, ClickRegion, Hit, LibraryView, RepeatMode, SearchCategory},
+    app::{full_size_url, fmt_count, fmt_duration, ActivePanel, App, ArtistRow, ArtistTab, ClickRegion, Hit, LibraryView, RepeatMode, SearchCategory},
     config::{AudioQuality, Theme},
     theme::MatugenColors,
 };
@@ -268,9 +268,101 @@ pub fn render(
         render_right_panel(f, app, workspace[2], &p, &mut hits);
     }
     let art = render_player_bar(f, app, root[1], &p, use_true_image_protocol, &mut hits);
-    app.clicks = hits;
     render_loading_popup(f, app, workspace[1], &p);
+    render_image_preview(f, app, &p);
+    render_context_menu(f, app, &p, &mut hits);
+    app.clicks = hits;
     art
+}
+
+/// Large, finer rendering of the artwork under the mouse.
+fn render_image_preview(f: &mut ratatui::Frame<'_>, app: &App, p: &Palette) {
+    let Some(url) = app.image_preview.as_ref() else { return };
+    let now_cover = app.now_playing.as_ref().and_then(|n| n.album_art_url.as_deref()) == Some(url.as_str());
+    let img = if now_cover {
+        app.cover_art.as_ref()
+    } else {
+        app.images
+            .get(url)
+            .filter(|i| i.width() > 1)
+            .or_else(|| app.images.get(&url.replace("500x500", "250x250")).filter(|i| i.width() > 1))
+    };
+    let Some(img) = img else { return };
+    let screen = f.size();
+    let h = screen.height.saturating_sub(6).min(44);
+    let w = (h * 2).min(screen.width.saturating_sub(4));
+    let h = w / 2;
+    if h < 4 {
+        return;
+    }
+    let rect = Rect {
+        x: screen.x + (screen.width - (w + 2)) / 2,
+        y: screen.y + (screen.height - (h + 2)) / 2,
+        width: w + 2,
+        height: h + 2,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.surface));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    render_image(f, img, inner, p.surface, false);
+}
+
+/// Right-click / `m` menu for a track, drawn at the pointer.
+fn render_context_menu(f: &mut ratatui::Frame<'_>, app: &App, p: &Palette, hits: &mut Hits) {
+    let Some(menu) = app.context_menu.as_ref() else { return };
+    let items = app.menu_items();
+    if items.is_empty() {
+        return;
+    }
+    let screen = f.size();
+    let title = centered_text(&menu.track.1, 30);
+    let width = items
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(10)
+        .max(title.chars().count() + 2) as u16
+        + 4;
+    let max_rows = screen.height.saturating_sub(4).max(3) as usize;
+    let visible = items.len().min(max_rows.min(14));
+    let scroll = menu.selected.saturating_sub(visible - 1);
+    let height = visible as u16 + 2;
+    let x = menu.x.min(screen.width.saturating_sub(width));
+    let y = menu.y.min(screen.height.saturating_sub(height));
+    let rect = Rect { x, y, width, height };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(Span::styled(format!(" {title} "), Style::default().fg(p.muted)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.surface).fg(p.fg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let lines: Vec<Line<'static>> = items
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(i, item)| {
+            let style = if i == menu.selected {
+                Style::default().fg(Color::Black).bg(p.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.fg)
+            };
+            let padded = format!(" {:<w$}", item, w = inner.width.saturating_sub(1) as usize);
+            Line::from(Span::styled(padded, style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+    for (row, i) in (scroll..scroll + visible).enumerate() {
+        hit(hits, Rect { x: inner.x, y: inner.y + row as u16, width: inner.width, height: 1 }, Hit::MenuItem(i));
+    }
 }
 
 /// Small centered popup while a request is in flight. Appears after a short
@@ -864,6 +956,9 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
         width: photo_cols.min(cols[0].width.saturating_sub(2)),
         height: 12.min(cols[0].height),
     };
+    if let Some(url) = page.picture_url.as_ref() {
+        hit(hits, photo_area, Hit::Image(full_size_url(url)));
+    }
     match page.picture_url.as_ref().and_then(|u| app.images.get(u)) {
         Some(img) if img.width() > 1 => render_image(f, img, photo_area, p.bg, true),
         _ => f.render_widget(
@@ -1000,17 +1095,18 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
 // ── Right column: detail card + shortcuts ─────────────────────────────────────
 
 fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits) {
-    let (label, img, title, subtitle): (&str, Option<&DynamicImage>, String, String) =
+    let (label, img, title, subtitle, preview_url): (&str, Option<&DynamicImage>, String, String, Option<String>) =
         match app.selected_detail() {
             Some((url, title, subtitle)) => (
                 "Selected",
                 url.as_ref().and_then(|u| app.images.get(u)).filter(|i| i.width() > 1),
                 title,
                 subtitle,
+                url.as_deref().map(full_size_url),
             ),
             None => match &app.now_playing {
-                Some(now) => ("Now playing", app.cover_art.as_ref(), now.title.clone(), now.artist.clone()),
-                None => ("", None, String::new(), String::new()),
+                Some(now) => ("Now playing", app.cover_art.as_ref(), now.title.clone(), now.artist.clone(), now.album_art_url.clone()),
+                None => ("", None, String::new(), String::new(), None),
             },
         };
 
@@ -1031,6 +1127,9 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
             width: img_w,
             height: 10.min(inner.height),
         };
+        if let (Some(url), Some(_)) = (preview_url.as_ref(), img) {
+            hit(hits, img_area, Hit::Image(url.clone()));
+        }
         match img {
             Some(img) => render_image(f, img, img_area, p.bg, false),
             None => f.render_widget(
@@ -1091,7 +1190,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
             ActivePanel::Search => {}
         }
     }
-    let global: [(&str, &str); 9] = [
+    let global: [(&str, &str); 11] = [
         ("Tab", "Next panel"),
         ("S-Tab", "Previous panel"),
         ("j k", "Move"),
@@ -1099,6 +1198,8 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
         ("p", "Play / pause"),
         ("a", "Artist of track"),
         ("e", "Album of track"),
+        ("m", "Track menu"),
+        ("Z", "Play next"),
         ("t", "Theme"),
         ("q", "Quit"),
     ];
@@ -1110,7 +1211,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" MOUSE", muted(p).add_modifier(Modifier::BOLD))));
-    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("Wheel", "Scroll / volume")] {
+    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("R-click", "Track menu"), ("Artwork", "Hover: preview"), ("Wheel", "Scroll / volume")] {
         lines.push(Line::from(vec![key_span(k, p), Span::styled(d.to_string(), Style::default().fg(p.fg))]));
     }
     lines.push(Line::from(""));
@@ -1185,6 +1286,9 @@ fn render_player_bar(
             );
         } else if let Some(img) = &app.cover_art {
             render_image(f, img, split[0], p.bg, false);
+        }
+        if let Some(url) = app.now_playing.as_ref().and_then(|n| n.album_art_url.clone()) {
+            hit(hits, split[0], Hit::Image(url));
         }
         f.render_widget(
             track_info.block(panel(None, false, p).padding(Padding::new(1, 1, 1, 0))),
@@ -1264,10 +1368,11 @@ fn render_player_bar(
     let mut cells: Vec<Span<'static>> = Vec::with_capacity(bar_w);
     for i in 0..bar_w {
         if i < filled {
+            // Box-drawing glyphs share the same cell-filling metrics, unlike "/" and "|".
             let (glyph, bright) = if app.is_playing {
-                ("/", (i as i64 - phase).rem_euclid(4) < 2)
+                ("╱", (i as i64 - phase).rem_euclid(4) < 2)
             } else {
-                ("|", i % 2 == 0)
+                ("│", i % 2 == 0)
             };
             cells.push(Span::styled(glyph, Style::default().fg(if bright { light } else { dark }).add_modifier(Modifier::BOLD)));
         } else {
@@ -1275,7 +1380,14 @@ fn render_player_bar(
         }
     }
     f.render_widget(Paragraph::new(Line::from(cells)), gauge_rect);
-    hit(hits, gauge_rect, Hit::Progress);
+    // Generous click target: the whole progress row and the empty row under it.
+    let progress_hit = Rect {
+        x: gauge_rect.x,
+        y: gauge_rect.y,
+        width: gauge_rect.width,
+        height: (centre[3].height.min(1) + 1).max(1),
+    };
+    hit(hits, progress_hit, Hit::Progress);
     f.render_widget(Paragraph::new(fmt(total_ms)).style(time_style).alignment(Alignment::Left), progress_row[2]);
 
     // Right: volume + quality

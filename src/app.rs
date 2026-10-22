@@ -34,6 +34,11 @@ pub enum Command {
     LoadFavoriteArtists,
     LoadArtist(String),
     LoadAlbum(String),
+    AddToPlaylist {
+        playlist_id: String,
+        playlist_title: String,
+        track_id: String,
+    },
     /// Resolve a track's album / artist from its metadata, then open it.
     OpenAlbumOfTrack(String),
     OpenArtistOfTrack(String),
@@ -61,6 +66,8 @@ pub enum UiEvent {
     PlaybackStopped,
     Error(String),
     PlaylistsLoaded(Vec<(String, String)>),
+    /// Playlists the user owns (targets of "Add to playlist").
+    OwnPlaylistsLoaded(Vec<(String, String)>),
     TracksLoaded(Vec<(String, String, String)>),
     SearchResultsLoaded {
         tracks: Vec<(String, String, String)>,
@@ -176,6 +183,31 @@ pub enum Hit {
     /// Title of a track: opens its album. Artist name: opens the artist page.
     TrackAlbum(String),
     TrackArtist(String),
+    /// A row of the open context menu.
+    MenuItem(usize),
+    /// An artwork; hovering shows a large preview (url of the full-size image).
+    Image(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuPage {
+    Main,
+    Playlists,
+}
+
+/// Right-click / `m` menu for a track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextMenu {
+    pub track: (String, String, String),
+    pub x: u16,
+    pub y: u16,
+    pub selected: usize,
+    pub page: MenuPage,
+}
+
+/// Full-size variant of a Deezer image url.
+pub fn full_size_url(url: &str) -> String {
+    url.replace("250x250", "500x500")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +344,10 @@ pub struct App {
     pub shortcuts_scroll: u16,
     pub shortcuts_max_scroll: u16,
     pub right_panel_visible: bool,
+    pub own_playlists: Vec<(String, String)>,
+    pub context_menu: Option<ContextMenu>,
+    /// Full-size image url being previewed (hover on an artwork).
+    pub image_preview: Option<String>,
     /// Wallpaper palette (None until DMS has written it).
     pub matugen: Option<MatugenColors>,
     pub logo_hover: bool,
@@ -392,6 +428,9 @@ impl App {
             shortcuts_scroll: 0,
             shortcuts_max_scroll: 0,
             right_panel_visible: true,
+            own_playlists: vec![],
+            context_menu: None,
+            image_preview: None,
             matugen: None,
             logo_hover: false,
             history: Vec::new(),
@@ -828,7 +867,145 @@ impl App {
         if let Some((Some(url), _, _)) = self.selected_detail() {
             urls.push(url);
         }
+        if let Some(url) = &self.image_preview {
+            urls.push(url.clone());
+        }
         urls
+    }
+
+    /// The track shown on a given row of the main list, if that row is a track.
+    pub fn track_at_main_row(&self, index: usize) -> Option<(String, String, String)> {
+        if self.viewing_settings || self.library_view.is_some() {
+            return None;
+        }
+        if self.viewing_artist {
+            if let Some(ArtistRow::Track(i)) = self.artist_rows.get(index) {
+                let t = self.artist_page.as_ref()?.top_tracks.get(*i)?;
+                return Some((t.id.clone(), t.title.clone(), t.artist.clone()));
+            }
+            return None;
+        }
+        if self.showing_search_results && self.search_category != SearchCategory::Tracks {
+            return None;
+        }
+        self.current_tracks.get(index.checked_sub(1)?).cloned()
+    }
+
+    /// Track under the keyboard selection (main list or queue).
+    pub fn selected_track(&self) -> Option<(String, String, String)> {
+        match self.active_panel {
+            ActivePanel::Queue => self.queue_tracks.get(self.queue_state.selected()?).cloned(),
+            _ => self.track_at_main_row(self.main_state.selected()?),
+        }
+    }
+
+    /// Insert a track right after the current one (`next`) or at the end of
+    /// the queue. With nothing playing, the track starts right away.
+    pub fn enqueue(&mut self, track: (String, String, String), next: bool) {
+        let label = format!("{} - {}", track.1, track.2);
+        match self.queue_index {
+            Some(current) if !self.queue_tracks.is_empty() => {
+                let pos = if next { (current + 1).min(self.queue_tracks.len()) } else { self.queue_tracks.len() };
+                self.queue_tracks.insert(pos, track.clone());
+                self.queue.insert(pos, label);
+                self.status_message = if next {
+                    format!("Up next: {}", track.1)
+                } else {
+                    format!("Added to queue: {}", track.1)
+                };
+            }
+            _ => {
+                self.queue_tracks.push(track.clone());
+                self.queue.push(label);
+                let idx = self.queue_tracks.len() - 1;
+                self.queue_index = Some(idx);
+                self.queue_state.select(Some(idx));
+                let _ = self.command_sender.send(Command::PlayTrack(track.0.clone()));
+                self.is_playing = true;
+                self.status_message = format!("Playing: {}", track.1);
+            }
+        }
+    }
+
+    pub fn open_track_menu(&mut self, track: (String, String, String), x: u16, y: u16) {
+        self.context_menu = Some(ContextMenu { track, x, y, selected: 0, page: MenuPage::Main });
+    }
+
+    pub fn menu_items(&self) -> Vec<String> {
+        match self.context_menu.as_ref().map(|m| &m.page) {
+            Some(MenuPage::Main) => vec![
+                "▶  Play next".to_string(),
+                "≡  Add to queue".to_string(),
+                "＋  Add to playlist   ▸".to_string(),
+            ],
+            Some(MenuPage::Playlists) => {
+                let mut items = vec!["◂  Back".to_string()];
+                if self.own_playlists.is_empty() {
+                    items.push("(no playlist of yours yet)".to_string());
+                } else {
+                    items.extend(self.own_playlists.iter().map(|(_, title)| format!("≡  {title}")));
+                }
+                items
+            }
+            None => vec![],
+        }
+    }
+
+    pub fn menu_move(&mut self, delta: i32) {
+        let n = self.menu_items().len() as i32;
+        if let Some(menu) = self.context_menu.as_mut() {
+            if n > 0 {
+                menu.selected = (menu.selected as i32 + delta).rem_euclid(n) as usize;
+            }
+        }
+    }
+
+    pub fn menu_back(&mut self) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            if menu.page == MenuPage::Playlists {
+                menu.page = MenuPage::Main;
+                menu.selected = 2;
+            } else {
+                self.context_menu = None;
+            }
+        }
+    }
+
+    pub fn menu_activate(&mut self) {
+        let Some(menu) = self.context_menu.clone() else { return };
+        match menu.page {
+            MenuPage::Main => match menu.selected {
+                0 => {
+                    self.context_menu = None;
+                    self.enqueue(menu.track, true);
+                }
+                1 => {
+                    self.context_menu = None;
+                    self.enqueue(menu.track, false);
+                }
+                _ => {
+                    if let Some(m) = self.context_menu.as_mut() {
+                        m.page = MenuPage::Playlists;
+                        m.selected = if self.own_playlists.is_empty() { 0 } else { 1 };
+                    }
+                }
+            },
+            MenuPage::Playlists => {
+                if menu.selected == 0 {
+                    self.menu_back();
+                } else if let Some((playlist_id, playlist_title)) = self.own_playlists.get(menu.selected - 1).cloned() {
+                    self.status_message = format!("Adding to {playlist_title}…");
+                    let _ = self.command_sender.send(Command::AddToPlaylist {
+                        playlist_id,
+                        playlist_title,
+                        track_id: menu.track.0.clone(),
+                    });
+                    self.context_menu = None;
+                } else {
+                    self.context_menu = None;
+                }
+            }
+        }
     }
 
     pub fn switch_search_category_right(&mut self) {

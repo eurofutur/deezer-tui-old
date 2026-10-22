@@ -347,7 +347,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(user_id) = client.user_id() {
                             match client.fetch_user_playlists(user_id).await {
                                 Ok(playlists) => {
-                                    let _ = playlists_event_tx.send(UiEvent::PlaylistsLoaded(playlists));
+                                    let own = playlists
+                                        .iter()
+                                        .filter(|(_, _, own)| *own)
+                                        .map(|(id, title, _)| (id.clone(), title.clone()))
+                                        .collect();
+                                    let all = playlists.into_iter().map(|(id, title, _)| (id, title)).collect();
+                                    let _ = playlists_event_tx.send(UiEvent::PlaylistsLoaded(all));
+                                    let _ = playlists_event_tx.send(UiEvent::OwnPlaylistsLoaded(own));
                                 }
                                 Err(err) => {
                                     let _ = playlists_event_tx.send(UiEvent::Error(format!("API Error fetching playlists: {}", err)));
@@ -714,7 +721,11 @@ async fn run_tui_loop(
                         .await
                         .ok()
                         .and_then(|bytes| image::load_from_memory(&bytes).ok())
-                        .map(|img| img.thumbnail(64, 64)),
+                        .map(|img| {
+                            // Thumbnails stay tiny; previews keep enough pixels for a big popup.
+                            let max = if url.contains("500x500") { 320 } else { 64 };
+                            img.thumbnail(max, max)
+                        }),
                     Err(_) => None,
                 };
                 let _ = tx.send((url, img));
@@ -798,7 +809,34 @@ async fn run_tui_loop(
             }
             while let Some((code, mods)) = pending_keys.pop_front() {
                     let in_search = app.is_searching || app.active_panel == ActivePanel::Search;
+                    let menu_open = app.context_menu.is_some();
                     match code {
+                        KeyCode::Esc if menu_open => app.context_menu = None,
+                        KeyCode::Up | KeyCode::Char('k') if menu_open => app.menu_move(-1),
+                        KeyCode::Down | KeyCode::Char('j') if menu_open => app.menu_move(1),
+                        KeyCode::Enter | KeyCode::Right if menu_open => app.menu_activate(),
+                        KeyCode::Left if menu_open => app.menu_back(),
+                        _ if menu_open => {}
+                        // Track menu for the selected row (same as right-click).
+                        KeyCode::Char('m') if !in_search => {
+                            if let Some(track) = app.selected_track() {
+                                let selected = app.main_state.selected();
+                                let anchor = app
+                                    .clicks
+                                    .iter()
+                                    .find(|c| matches!(c.hit, Hit::MainRow { index, .. } if Some(index) == selected))
+                                    .map(|c| (c.rect.x + 6, c.rect.y + 1));
+                                let (x, y) = anchor.unwrap_or((40, 10));
+                                app.open_track_menu(track, x, y);
+                            } else {
+                                app.status_message = "Select a track first".into();
+                            }
+                        }
+                        // Shift+Z: play the selected track right after the current one.
+                        KeyCode::Char('Z') if !in_search => match app.selected_track() {
+                            Some(track) => app.enqueue(track, true),
+                            None => app.status_message = "Select a track first".into(),
+                        },
                         // Ctrl+Backspace clears the query (Alacritty and others send Ctrl+H).
                         KeyCode::Backspace | KeyCode::Char('h') if in_search && mods.contains(KeyModifiers::CONTROL) => {
                             app.search_query.clear();
@@ -1498,6 +1536,9 @@ async fn run_tui_loop(
                 UiEvent::HistoryLoaded(history) => {
                     apply_resume(app, &history);
                 }
+                UiEvent::OwnPlaylistsLoaded(playlists) => {
+                    app.own_playlists = playlists;
+                }
                 UiEvent::Loading(label) => {
                     app.loading = label.map(|l| (l, Instant::now()));
                 }
@@ -1846,6 +1887,22 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> An
     Ok(())
 }
 
+/// Restart the current track at `seek_ms`, keeping it paused if it was paused.
+fn seek_to(app: &mut App, now: &NowPlaying, seek_ms: u64) {
+    let _ = app.command_sender.send(Command::PlayTrackAt {
+        track_id: now.id.clone(),
+        quality: now.quality,
+        seek_ms,
+    });
+    if !app.is_playing {
+        let _ = app.command_sender.send(Command::Pause);
+    }
+    if let Some(n) = app.now_playing.as_mut() {
+        n.current_ms = seek_ms;
+    }
+    app.status_message = format!("Seek: {}:{:02}", seek_ms / 60_000, (seek_ms / 1000) % 60);
+}
+
 /// Resolve a mouse event against the regions recorded by the last render.
 /// Actions that already exist as key handlers are queued as synthetic keys.
 fn handle_mouse(
@@ -1867,9 +1924,21 @@ fn handle_mouse(
             }
             let region = app.clicks.iter().rev().find(|c| inside(c.rect)).cloned();
             app.logo_hover = matches!(region.as_ref().map(|r| &r.hit), Some(Hit::Logo));
+            app.image_preview = match region.as_ref().map(|r| &r.hit) {
+                Some(Hit::Image(url)) => Some(url.clone()),
+                _ => None,
+            };
+            if app.context_menu.is_some() {
+                if let Some(Hit::MenuItem(i)) = region.as_ref().map(|r| r.hit.clone()) {
+                    if let Some(menu) = app.context_menu.as_mut() {
+                        menu.selected = i;
+                    }
+                }
+                return;
+            }
             let Some(region) = region else { return };
             match region.hit {
-                Hit::Logo => {}
+                Hit::Logo | Hit::Image(_) | Hit::MenuItem(_) => {}
                 Hit::Focus(panel) => app.active_panel = panel,
                 Hit::NavItem(i) => {
                     app.active_panel = ActivePanel::Navigation;
@@ -1941,12 +2010,8 @@ fn handle_mouse(
                             } else {
                                 now.current_ms.saturating_sub(5_000)
                             };
-                            let _ = app.command_sender.send(Command::PlayTrackAt {
-                                track_id: now.id.clone(),
-                                quality: now.quality,
-                                seek_ms,
-                            });
-                            app.status_message = format!("Seek: {}s", seek_ms / 1000);
+                            let now = now.clone();
+                            seek_to(app, &now, seek_ms);
                         }
                     }
                     return;
@@ -1969,7 +2034,41 @@ fn handle_mouse(
                 }
             }
         }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Context menu for the track under the pointer (row, title or artist span).
+            let track = app
+                .clicks
+                .iter()
+                .rev()
+                .filter(|c| inside(c.rect))
+                .find_map(|c| match c.hit {
+                    Hit::MainRow { index, .. } => app.track_at_main_row(index),
+                    Hit::QueueItem(i) => app.queue_tracks.get(i).cloned(),
+                    _ => None,
+                });
+            match track {
+                Some(track) => app.open_track_menu(track, m.column, m.row),
+                None => app.context_menu = None,
+            }
+        }
         MouseEventKind::Down(MouseButton::Left) => {
+            if app.context_menu.is_some() {
+                // Click on an item activates it; anywhere else closes the menu.
+                let item = app.clicks.iter().rev().find(|c| inside(c.rect)).and_then(|c| match c.hit {
+                    Hit::MenuItem(i) => Some(i),
+                    _ => None,
+                });
+                match item {
+                    Some(i) => {
+                        if let Some(menu) = app.context_menu.as_mut() {
+                            menu.selected = i;
+                        }
+                        app.menu_activate();
+                    }
+                    None => app.context_menu = None,
+                }
+                return;
+            }
             let Some(region) = app.clicks.iter().rev().find(|c| inside(c.rect)).cloned() else {
                 return;
             };
@@ -2037,19 +2136,14 @@ fn handle_mouse(
                 }
                 Hit::Progress => {
                     app.active_panel = ActivePanel::PlayerProgress;
-                    if let Some(now) = app.now_playing.as_ref() {
+                    if let Some(now) = app.now_playing.clone() {
                         if now.quality == AudioQuality::Flac {
                             app.status_message = "FLAC seek is disabled".into();
                         } else {
                             let ratio = (m.column.saturating_sub(region.rect.x)) as f64
                                 / region.rect.width.max(1) as f64;
                             let seek_ms = ((now.total_ms as f64) * ratio.clamp(0.0, 1.0)) as u64;
-                            let _ = app.command_sender.send(Command::PlayTrackAt {
-                                track_id: now.id.clone(),
-                                quality: now.quality,
-                                seek_ms,
-                            });
-                            app.status_message = format!("Seek: {}s", seek_ms / 1000);
+                            seek_to(app, &now, seek_ms);
                         }
                     }
                 }
@@ -2069,6 +2163,7 @@ fn handle_mouse(
                     app.status_message = "Opening artist...".into();
                     let _ = app.command_sender.send(Command::OpenArtistOfTrack(track_id));
                 }
+                Hit::MenuItem(_) | Hit::Image(_) => {}
             }
         }
         _ => {}
@@ -2459,6 +2554,13 @@ async fn audio_worker_loop(
                         Ok(UiEvent::AlbumLoaded(fetch_album_cached(&client, &cache, &album_id).await?))
                     }),
                 }
+            }
+            Command::AddToPlaylist { playlist_id, playlist_title, track_id } => {
+                api.run("Adding to playlist…", move |client, cache| async move {
+                    client.add_track_to_playlist(&playlist_id, &track_id).await?;
+                    cache.lock().unwrap().playlists.remove(&playlist_id);
+                    Ok(UiEvent::Error(format!("Added to {playlist_title}")))
+                });
             }
             Command::OpenAlbumOfTrack(track_id) => {
                 let cached = {
