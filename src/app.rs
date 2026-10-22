@@ -243,6 +243,8 @@ pub enum ActivePanel {
     Player,
     PlayerProgress,
     PlayerInfo,
+    /// Right-hand shortcuts panel (scrollable).
+    Shortcuts,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +305,10 @@ pub struct App {
     pub clicks: Vec<ClickRegion>,
     /// Request in flight, shown as a popup after a short delay.
     pub loading: Option<(String, Instant)>,
+    /// Scroll offset / limit of the shortcuts panel, and whether it is shown.
+    pub shortcuts_scroll: u16,
+    pub shortcuts_max_scroll: u16,
+    pub right_panel_visible: bool,
     /// Previous views, most recent last (Esc pops one).
     pub history: Vec<ViewState>,
     /// Set while restoring a view from the history so it is not pushed again.
@@ -377,6 +383,9 @@ impl App {
             current_album: None,
             clicks: Vec::new(),
             loading: None,
+            shortcuts_scroll: 0,
+            shortcuts_max_scroll: 0,
+            right_panel_visible: true,
             history: Vec::new(),
             navigating_back: false,
         }
@@ -481,6 +490,9 @@ impl App {
             ActivePanel::PlayerInfo => {
                 self.player_info_index = (self.player_info_index + 1).min(1);
             }
+            ActivePanel::Shortcuts => {
+                self.shortcuts_scroll = (self.shortcuts_scroll + 1).min(self.shortcuts_max_scroll);
+            }
         }
     }
 
@@ -569,6 +581,9 @@ impl App {
             ActivePanel::PlayerInfo => {
                 self.active_panel = ActivePanel::Player;
             }
+            ActivePanel::Shortcuts => {
+                self.shortcuts_scroll = self.shortcuts_scroll.saturating_sub(1);
+            }
         }
     }
 
@@ -593,6 +608,7 @@ impl App {
             ActivePanel::PlayerProgress => {
                 self.active_panel = ActivePanel::PlayerInfo;
             }
+            ActivePanel::Shortcuts => {}
             ActivePanel::PlayerInfo => {
                 self.player_info_index = (self.player_info_index + 1).min(1);
             }

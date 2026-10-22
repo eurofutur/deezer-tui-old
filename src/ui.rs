@@ -232,10 +232,14 @@ pub fn render(
         .split(root[0]);
 
     let mut hits: Hits = Vec::new();
+    app.right_panel_visible = right_width > 0;
+    if !app.right_panel_visible && app.active_panel == ActivePanel::Shortcuts {
+        app.active_panel = ActivePanel::Main;
+    }
     render_sidebar(f, app, workspace[0], &p, &mut hits);
     render_main(f, app, workspace[1], &p, &mut hits);
     if right_width > 0 {
-        render_right_panel(f, app, workspace[2], &p);
+        render_right_panel(f, app, workspace[2], &p, &mut hits);
     }
     let art = render_player_bar(f, app, root[1], &p, use_true_image_protocol, &mut hits);
     app.clicks = hits;
@@ -957,7 +961,7 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
 
 // ── Right column: detail card + shortcuts ─────────────────────────────────────
 
-fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &Palette) {
+fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits) {
     let (label, img, title, subtitle): (&str, Option<&DynamicImage>, String, String) =
         match app.selected_detail() {
             Some((url, title, subtitle)) => (
@@ -1045,6 +1049,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &Pal
             ActivePanel::Player => keys.extend([("← →", "Choose button"), ("Enter", "Activate"), ("↓", "Progress bar")]),
             ActivePanel::PlayerProgress => keys.extend([("← →", "Seek ±5 s"), ("↑", "Buttons")]),
             ActivePanel::PlayerInfo => keys.extend([("← →", "Adjust"), ("↑ ↓", "Volume / quality")]),
+            ActivePanel::Shortcuts => keys.extend([("↑ ↓", "Scroll this list"), ("Wheel", "Scroll this list")]),
             ActivePanel::Search => {}
         }
     }
@@ -1059,7 +1064,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &Pal
         ("t", "Theme"),
         ("q", "Quit"),
     ];
-    let key_span = |k: &str, p: &Palette| Span::styled(format!(" {:<7}", k), Style::default().fg(p.accent).add_modifier(Modifier::BOLD));
+    let key_span = |k: &str, p: &Palette| Span::styled(format!(" {:<8}", k), Style::default().fg(p.accent).add_modifier(Modifier::BOLD));
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(" HERE", muted(p).add_modifier(Modifier::BOLD))));
     for (k, d) in &keys {
@@ -1075,7 +1080,27 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &Pal
     for (k, d) in &global {
         lines.push(Line::from(vec![key_span(k, p), Span::styled(d.to_string(), Style::default().fg(p.fg))]));
     }
-    f.render_widget(Paragraph::new(lines).block(panel(Some("Shortcuts"), false, p)), rows[1]);
+    let active = app.active_panel == ActivePanel::Shortcuts;
+    let block = panel(Some("Shortcuts"), active, p);
+    let inner = block.inner(rows[1]);
+    app.shortcuts_max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+    app.shortcuts_scroll = app.shortcuts_scroll.min(app.shortcuts_max_scroll);
+    let scrolled = app.shortcuts_scroll;
+    let more_below = scrolled < app.shortcuts_max_scroll;
+    f.render_widget(Paragraph::new(lines).scroll((scrolled, 0)).block(block), rows[1]);
+    if more_below && inner.height > 0 {
+        f.render_widget(
+            Paragraph::new("▾ more").alignment(Alignment::Right).style(muted(p)),
+            Rect { y: inner.y + inner.height - 1, height: 1, ..inner },
+        );
+    }
+    if scrolled > 0 {
+        f.render_widget(
+            Paragraph::new("▴").alignment(Alignment::Right).style(muted(p)),
+            Rect { height: 1, ..inner },
+        );
+    }
+    hit(hits, rows[1], Hit::Focus(ActivePanel::Shortcuts));
 }
 
 // ── Player bar ────────────────────────────────────────────────────────────────

@@ -930,7 +930,9 @@ async fn run_tui_loop(
                                 ActivePanel::Playlists => ActivePanel::Queue,
                                 ActivePanel::Queue => ActivePanel::Search,
                                 ActivePanel::Search => ActivePanel::Main,
+                                ActivePanel::Main if app.right_panel_visible => ActivePanel::Shortcuts,
                                 ActivePanel::Main => ActivePanel::Player,
+                                ActivePanel::Shortcuts => ActivePanel::Player,
                                 ActivePanel::PlayerProgress => ActivePanel::Navigation,
                                 ActivePanel::Player => ActivePanel::Navigation,
                                 ActivePanel::PlayerInfo => ActivePanel::Navigation,
@@ -943,7 +945,9 @@ async fn run_tui_loop(
                                 ActivePanel::Queue => ActivePanel::Playlists,
                                 ActivePanel::Search => ActivePanel::Queue,
                                 ActivePanel::Main => ActivePanel::Search,
+                                ActivePanel::Shortcuts => ActivePanel::Main,
                                 ActivePanel::PlayerProgress => ActivePanel::Main,
+                                ActivePanel::Player if app.right_panel_visible => ActivePanel::Shortcuts,
                                 ActivePanel::Player => ActivePanel::Main,
                                 ActivePanel::PlayerInfo => ActivePanel::Main,
                             };
@@ -1474,6 +1478,7 @@ async fn run_tui_loop(
                                     // Progress bar uses Left/Right for seek; Enter is a no-op.
                                 }
                                 ActivePanel::PlayerInfo => {}
+                                ActivePanel::Shortcuts => {}
                             }
                         }
                         _ => {}
