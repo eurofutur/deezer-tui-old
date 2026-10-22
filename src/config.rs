@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
     Deezer,
+    /// Colours from the DankMaterialShell / matugen wallpaper palette.
+    Matugen,
     SpotifyDark,
     NcmpcppBlue,
 }
@@ -10,7 +12,8 @@ pub enum Theme {
 impl Theme {
     pub fn next(self) -> Self {
         match self {
-            Theme::Deezer => Theme::SpotifyDark,
+            Theme::Deezer => Theme::Matugen,
+            Theme::Matugen => Theme::SpotifyDark,
             Theme::SpotifyDark => Theme::NcmpcppBlue,
             Theme::NcmpcppBlue => Theme::Deezer,
         }
@@ -19,6 +22,7 @@ impl Theme {
     pub fn label(self) -> &'static str {
         match self {
             Theme::Deezer => "Deezer",
+            Theme::Matugen => "Matugen",
             Theme::SpotifyDark => "Spotify Dark",
             Theme::NcmpcppBlue => "ncmpcpp Blue",
         }

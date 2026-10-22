@@ -5,12 +5,13 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
 use crate::{
     app::{fmt_count, fmt_duration, ActivePanel, App, ArtistRow, ArtistTab, ClickRegion, Hit, LibraryView, RepeatMode, SearchCategory},
     config::{AudioQuality, Theme},
+    theme::MatugenColors,
 };
 
 use image::DynamicImage;
@@ -26,8 +27,21 @@ pub struct Palette {
     pub warn: Color,
 }
 
-pub fn palette(theme: Theme) -> Palette {
+pub fn palette(theme: Theme, matugen: Option<&MatugenColors>) -> Palette {
     match theme {
+        Theme::Matugen => match matugen {
+            Some(m) => Palette {
+                bg: Color::Reset,
+                surface: m.surface,
+                accent: m.accent,
+                fg: m.fg,
+                muted: m.muted,
+                dim: m.dim,
+                warn: m.warn,
+            },
+            // Palette not generated yet: fall back to the Deezer look.
+            None => palette(Theme::Deezer, None),
+        },
         Theme::Deezer => Palette {
             // Terminal background shows through (Alacritty opacity / niri blur).
             bg: Color::Reset,
@@ -94,6 +108,18 @@ fn render_image(f: &mut ratatui::Frame<'_>, img: &DynamicImage, area: Rect, bg: 
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Darker shade of an RGB colour (other colours fall back to the dim grey).
+fn darken(color: Color, factor: f32) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            (r as f32 * factor) as u8,
+            (g as f32 * factor) as u8,
+            (b as f32 * factor) as u8,
+        ),
+        _ => Color::DarkGray,
+    }
 }
 
 fn quality_label(quality: AudioQuality) -> &'static str {
@@ -217,7 +243,7 @@ pub fn render(
     app: &mut App,
     use_true_image_protocol: bool,
 ) -> Option<Rect> {
-    let p = palette(app.config.theme);
+    let p = palette(app.config.theme, app.matugen.as_ref());
     f.render_widget(Block::default().style(Style::default().bg(p.bg).fg(p.fg)), f.size());
 
     let root = Layout::default()
@@ -297,12 +323,24 @@ fn render_sidebar(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pal
         .split(area);
 
     // Wordmark
+    // Hovering the wordmark lights it up; clicking it toggles Matugen / Deezer.
+    let logo_rect = Rect { x: sidebar[0].x, y: sidebar[0].y, width: 11.min(sidebar[0].width), height: 1 };
+    let (mark_style, text_style) = if app.logo_hover {
+        let on_white = Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD);
+        (on_white, on_white)
+    } else {
+        (Style::default().fg(p.accent).add_modifier(Modifier::BOLD), bold(p))
+    };
     let logo = Paragraph::new(Line::from(vec![
-        Span::styled(" ▶ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
-        Span::styled("DEEZER", bold(p)),
-        Span::styled("  tui", muted(p)),
+        Span::styled(" ▶ ", mark_style),
+        Span::styled("DEEZER ", text_style),
+        Span::styled(
+            format!(" {}", if app.config.theme == Theme::Matugen { "matugen" } else { "tui" }),
+            muted(p),
+        ),
     ]));
     f.render_widget(logo, sidebar[0]);
+    hit(hits, logo_rect, Hit::Logo);
 
     // Navigation: Home / Explore, then the library, then settings.
     let nav_active = app.active_panel == ActivePanel::Navigation;
@@ -473,7 +511,7 @@ fn render_main(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palett
 
 /// Inner text area of a header block (border + padding 2,2,1,0).
 fn header_inner(area: Rect) -> Rect {
-    panel(None, false, &palette(Theme::Deezer)).padding(Padding::new(2, 2, 1, 0)).inner(area)
+    panel(None, false, &palette(Theme::Deezer, None)).padding(Padding::new(2, 2, 1, 0)).inner(area)
 }
 
 fn header_block(f: &mut ratatui::Frame<'_>, area: Rect, lines: Vec<Line<'static>>, p: &Palette, active: bool) {
@@ -1214,18 +1252,29 @@ fn render_player_bar(
     let time_style = if seeking { Style::default().fg(p.warn).add_modifier(Modifier::BOLD) } else { muted(p) };
     let fmt = |ms: u64| format!("{:02}:{:02}", ms / 60_000, (ms / 1_000) % 60);
     f.render_widget(Paragraph::new(fmt(current_ms)).style(time_style).alignment(Alignment::Right), progress_row[0]);
-    let gauge = Gauge::default()
-        .style(Style::default().fg(p.dim))
-        .gauge_style(if seeking {
-            Style::default().fg(p.warn).bg(p.surface)
-        } else {
-            Style::default().fg(p.accent).bg(p.surface)
-        })
-        .use_unicode(true)
-        .ratio(ratio)
-        .label(if seeking { "◀ seek ▶" } else { "" });
+    // Striped progress bar: static "|||||" (alternating light / dark accent)
+    // while paused, "/////" stripes drifting to the right while playing. The
+    // phase follows the playback position, so it only moves when music does.
     let gauge_rect = Rect { x: progress_row[1].x + 1, width: progress_row[1].width.saturating_sub(2), ..progress_row[1] };
-    f.render_widget(gauge, gauge_rect);
+    let bar_w = gauge_rect.width as usize;
+    let filled = ((ratio * bar_w as f64).round() as usize).min(bar_w);
+    let light = if seeking { p.warn } else { p.accent };
+    let dark = darken(light, 0.45);
+    let phase = (current_ms / 110) as i64;
+    let mut cells: Vec<Span<'static>> = Vec::with_capacity(bar_w);
+    for i in 0..bar_w {
+        if i < filled {
+            let (glyph, bright) = if app.is_playing {
+                ("/", (i as i64 - phase).rem_euclid(4) < 2)
+            } else {
+                ("|", i % 2 == 0)
+            };
+            cells.push(Span::styled(glyph, Style::default().fg(if bright { light } else { dark }).add_modifier(Modifier::BOLD)));
+        } else {
+            cells.push(Span::styled("─", Style::default().fg(p.dim)));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(cells)), gauge_rect);
     hit(hits, gauge_rect, Hit::Progress);
     f.render_widget(Paragraph::new(fmt(total_ms)).style(time_style).alignment(Alignment::Left), progress_row[2]);
 

@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::api::{AlbumPage, ArtistPage, ArtistRef, HistoryEntry, LibraryAlbum};
 use crate::config::{AudioQuality, Config};
 use crate::state::PlaybackState;
+use crate::theme::MatugenColors;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -155,6 +156,8 @@ pub enum ViewState {
 /// renderer each frame (`App::clicks`) and resolved in the event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
+    /// The DEEZER wordmark: hover highlights it, click toggles Matugen / Deezer.
+    Logo,
     Focus(ActivePanel),
     SearchBar,
     NavItem(usize),
@@ -309,6 +312,9 @@ pub struct App {
     pub shortcuts_scroll: u16,
     pub shortcuts_max_scroll: u16,
     pub right_panel_visible: bool,
+    /// Wallpaper palette (None until DMS has written it).
+    pub matugen: Option<MatugenColors>,
+    pub logo_hover: bool,
     /// Previous views, most recent last (Esc pops one).
     pub history: Vec<ViewState>,
     /// Set while restoring a view from the history so it is not pushed again.
@@ -386,6 +392,8 @@ impl App {
             shortcuts_scroll: 0,
             shortcuts_max_scroll: 0,
             right_panel_visible: true,
+            matugen: None,
+            logo_hover: false,
             history: Vec::new(),
             navigating_back: false,
         }

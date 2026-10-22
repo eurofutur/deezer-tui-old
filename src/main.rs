@@ -6,6 +6,7 @@ mod discord_rpc;
 mod mpris;
 mod player;
 mod state;
+mod theme;
 mod ui;
 
 use std::{
@@ -25,7 +26,7 @@ use anyhow::{anyhow, Context, Result as AnyResult};
 use base64::Engine;
 use app::{ActivePanel, App, ArtistRow, Command, Hit, LibraryView, NowPlaying, RepeatMode, SearchCategory, UiEvent, ViewState};
 use std::collections::VecDeque;
-use config::{AudioQuality, Config};
+use config::{AudioQuality, Config, Theme};
 use api::{AlbumPage, ArtistPage, ArtistRef, HistoryEntry, LibraryAlbum};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -433,6 +434,8 @@ async fn run_tui_loop(
     let mut last_rpc_refresh = Instant::now();
     let mut last_state_save = Instant::now();
     let mut last_click: Option<(Instant, Hit)> = None;
+    let mut matugen = theme::MatugenWatcher::new();
+    app.matugen = matugen.colors.clone();
     let mut image_protocol = detect_image_protocol();
     let mut ueberzugpp_layer = match image_protocol {
         ImageProtocol::Ueberzugpp => UeberzugppLayer::start(),
@@ -467,6 +470,10 @@ async fn run_tui_loop(
         if last_rpc_refresh.elapsed() >= Duration::from_secs(5) {
             sync_discord_presence(discord_rpc, app);
             last_rpc_refresh = Instant::now();
+        }
+
+        if matugen.poll() {
+            app.matugen = matugen.colors.clone();
         }
 
         // Periodic snapshot so a crash or a killed terminal still resumes close
@@ -1858,10 +1865,11 @@ fn handle_mouse(
             if app.is_searching {
                 return;
             }
-            let Some(region) = app.clicks.iter().rev().find(|c| inside(c.rect)).cloned() else {
-                return;
-            };
+            let region = app.clicks.iter().rev().find(|c| inside(c.rect)).cloned();
+            app.logo_hover = matches!(region.as_ref().map(|r| &r.hit), Some(Hit::Logo));
+            let Some(region) = region else { return };
             match region.hit {
+                Hit::Logo => {}
                 Hit::Focus(panel) => app.active_panel = panel,
                 Hit::NavItem(i) => {
                     app.active_panel = ActivePanel::Navigation;
@@ -1974,6 +1982,11 @@ fn handle_mouse(
                 app.is_searching = false;
             }
             match region.hit {
+                Hit::Logo => {
+                    app.config.theme = if app.config.theme == Theme::Matugen { Theme::Deezer } else { Theme::Matugen };
+                    let _ = save_config(&app.config);
+                    app.status_message = format!("Theme: {}", app.config.theme.label());
+                }
                 Hit::Focus(panel) => app.active_panel = panel,
                 Hit::SearchBar => {
                     app.active_panel = ActivePanel::Search;
