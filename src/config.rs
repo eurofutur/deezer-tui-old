@@ -69,6 +69,16 @@ pub struct Config {
     /// Restore the last track / queue (local snapshot or Deezer history) on launch.
     #[serde(default = "default_true")]
     pub resume_on_start: bool,
+    /// Index into `SIDEBAR_SPLITS`: playlists / queue height ratio.
+    #[serde(default = "default_split")]
+    pub sidebar_split: usize,
+}
+
+/// Playlists / queue percentages cycled by clicking a panel title.
+pub const SIDEBAR_SPLITS: [(u16, u16); 5] = [(20, 80), (40, 60), (50, 50), (60, 40), (80, 20)];
+
+fn default_split() -> usize {
+    2
 }
 
 fn default_true() -> bool {
@@ -85,6 +95,7 @@ impl Default for Config {
             discord_rpc_enabled: false,
             arl: String::new(),
             resume_on_start: true,
+            sidebar_split: 2,
         }
     }
 }

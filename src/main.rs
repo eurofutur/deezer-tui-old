@@ -832,8 +832,8 @@ async fn run_tui_loop(
                                 app.status_message = "Select a track first".into();
                             }
                         }
-                        // Shift+Z: play the selected track right after the current one.
-                        KeyCode::Char('Z') if !in_search => match app.selected_track() {
+                        // z: play the selected track right after the current one.
+                        KeyCode::Char('z') if !in_search => match app.selected_track() {
                             Some(track) => app.enqueue(track, true),
                             None => app.status_message = "Select a track first".into(),
                         },
@@ -1938,7 +1938,7 @@ fn handle_mouse(
             }
             let Some(region) = region else { return };
             match region.hit {
-                Hit::Logo | Hit::Image(_) | Hit::MenuItem(_) => {}
+                Hit::Logo | Hit::Image(_) | Hit::MenuItem(_) | Hit::SplitCycle => {}
                 Hit::Focus(panel) => app.active_panel = panel,
                 Hit::NavItem(i) => {
                     app.active_panel = ActivePanel::Navigation;
@@ -2164,6 +2164,13 @@ fn handle_mouse(
                     let _ = app.command_sender.send(Command::OpenArtistOfTrack(track_id));
                 }
                 Hit::MenuItem(_) | Hit::Image(_) => {}
+                Hit::SplitCycle => {
+                    let n = config::SIDEBAR_SPLITS.len();
+                    app.config.sidebar_split = (app.config.sidebar_split + 1) % n;
+                    let (p_pct, q_pct) = config::SIDEBAR_SPLITS[app.config.sidebar_split];
+                    let _ = save_config(&app.config);
+                    app.status_message = format!("Playlists {p_pct}% / Queue {q_pct}%");
+                }
             }
         }
         _ => {}

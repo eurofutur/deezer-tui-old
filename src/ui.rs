@@ -10,7 +10,7 @@ use ratatui::{
 
 use crate::{
     app::{full_size_url, fmt_count, fmt_duration, ActivePanel, App, ArtistRow, ArtistTab, ClickRegion, Hit, LibraryView, RepeatMode, SearchCategory},
-    config::{AudioQuality, Theme},
+    config::{AudioQuality, Theme, SIDEBAR_SPLITS},
     theme::MatugenColors,
 };
 
@@ -403,13 +403,14 @@ fn render_loading_popup(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &P
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 
 fn render_sidebar(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits) {
+    let (playlists_pct, queue_pct) = SIDEBAR_SPLITS[app.config.sidebar_split % SIDEBAR_SPLITS.len()];
     let sidebar = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Length(12),
-            Constraint::Percentage(50),
-            Constraint::Min(3),
+            Constraint::Ratio(playlists_pct as u32, 100),
+            Constraint::Ratio(queue_pct as u32, 100),
             Constraint::Length(1),
         ])
         .split(area);
@@ -512,6 +513,7 @@ fn render_sidebar(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pal
     hit(hits, sidebar[2], Hit::Focus(ActivePanel::Playlists));
     let heights = vec![1u16; app.playlists.len()];
     register_rows(hits, playlist_inner, &app.playlist_state, &heights, &|i| Some(Hit::PlaylistItem(i)));
+    hit(hits, Rect { height: 1, ..sidebar[2] }, Hit::SplitCycle);
 
     // Queue
     let current = app.queue_index;
@@ -541,6 +543,7 @@ fn render_sidebar(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pal
     hit(hits, sidebar[3], Hit::Focus(ActivePanel::Queue));
     let heights = vec![1u16; app.queue.len()];
     register_rows(hits, queue_inner, &app.queue_state, &heights, &|i| Some(Hit::QueueItem(i)));
+    hit(hits, Rect { height: 1, ..sidebar[3] }, Hit::SplitCycle);
 
     // Status line
     let status_style = if app.status_message.starts_with("Error") || app.status_message.contains("rror:") {
@@ -1199,7 +1202,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
         ("a", "Artist of track"),
         ("e", "Album of track"),
         ("m", "Track menu"),
-        ("Z", "Play next"),
+        ("z", "Play next"),
         ("t", "Theme"),
         ("q", "Quit"),
     ];
@@ -1211,7 +1214,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" MOUSE", muted(p).add_modifier(Modifier::BOLD))));
-    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("R-click", "Track menu"), ("Artwork", "Hover: preview"), ("Wheel", "Scroll / volume")] {
+    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("R-click", "Track menu"), ("Artwork", "Hover: preview"), ("Titles", "Resize lists"), ("Wheel", "Scroll / volume")] {
         lines.push(Line::from(vec![key_span(k, p), Span::styled(d.to_string(), Style::default().fg(p.fg))]));
     }
     lines.push(Line::from(""));

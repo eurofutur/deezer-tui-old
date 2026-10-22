@@ -185,6 +185,8 @@ pub enum Hit {
     TrackArtist(String),
     /// A row of the open context menu.
     MenuItem(usize),
+    /// Title bar of the Playlists / Queue panels: cycles their height split.
+    SplitCycle,
     /// An artwork; hovering shows a large preview (url of the full-size image).
     Image(String),
 }
