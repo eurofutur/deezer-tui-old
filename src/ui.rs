@@ -122,6 +122,107 @@ fn darken(color: Color, factor: f32) -> Color {
     }
 }
 
+/// Finer rendering with quadrant blocks: 2×2 sub-pixels per cell, two colours
+/// per cell chosen as the most distant pair, every sub-pixel snapped to the
+/// nearer one. Four times the detail of the half-block renderer.
+fn render_image_fine(f: &mut ratatui::Frame<'_>, img: &DynamicImage, area: Rect, bg: Color, circular: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    const GLYPHS: [&str; 16] = [
+        " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+    ];
+    let (px_w, px_h) = (area.width as u32 * 2, area.height as u32 * 2);
+    let rgb = img.resize_exact(px_w, px_h, image::imageops::FilterType::Lanczos3).to_rgb8();
+    let (cx, cy) = (px_w as f32 / 2.0, px_h as f32 / 2.0);
+    let bg_rgb = match bg {
+        Color::Rgb(r, g, b) => [r as f32, g as f32, b as f32],
+        _ => [0.0, 0.0, 0.0],
+    };
+    let sample = |x: u32, y: u32| -> [f32; 3] {
+        if circular {
+            let dx = (x as f32 + 0.5 - cx) / cx;
+            let dy = (y as f32 + 0.5 - cy) / cy;
+            if dx * dx + dy * dy > 1.0 {
+                return bg_rgb;
+            }
+        }
+        let p = rgb.get_pixel(x, y);
+        [p[0] as f32, p[1] as f32, p[2] as f32]
+    };
+    let dist = |a: &[f32; 3], b: &[f32; 3]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
+    let to_color = |c: [f32; 3]| Color::Rgb(c[0].round() as u8, c[1].round() as u8, c[2].round() as u8);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+    for row in 0..area.height {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(area.width as usize);
+        for col in 0..area.width {
+            let (x, y) = (col as u32 * 2, row as u32 * 2);
+            let px = [sample(x, y), sample(x + 1, y), sample(x, y + 1), sample(x + 1, y + 1)];
+            // Two most distant sub-pixels become the fg / bg seeds.
+            let (mut a, mut b, mut best) = (0usize, 0usize, -1.0f32);
+            for i in 0..4 {
+                for j in i + 1..4 {
+                    let d = dist(&px[i], &px[j]);
+                    if d > best {
+                        best = d;
+                        a = i;
+                        b = j;
+                    }
+                }
+            }
+            let mut mask = 0u8;
+            let (mut fg_sum, mut fg_n, mut bg_sum, mut bg_n) = ([0.0f32; 3], 0.0f32, [0.0f32; 3], 0.0f32);
+            for (i, p) in px.iter().enumerate() {
+                let to_fg = best > 0.0 && dist(p, &px[a]) <= dist(p, &px[b]);
+                if to_fg {
+                    mask |= 1 << i;
+                    for k in 0..3 {
+                        fg_sum[k] += p[k];
+                    }
+                    fg_n += 1.0;
+                } else {
+                    for k in 0..3 {
+                        bg_sum[k] += p[k];
+                    }
+                    bg_n += 1.0;
+                }
+            }
+            let mean = |s: [f32; 3], n: f32| if n > 0.0 { [s[0] / n, s[1] / n, s[2] / n] } else { bg_rgb };
+            let fg_c = to_color(mean(fg_sum, fg_n));
+            let bg_c = to_color(mean(bg_sum, bg_n));
+            spans.push(Span::styled(GLYPHS[mask as usize], Style::default().fg(fg_c).bg(bg_c)));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Draw an artwork: sharpened (quadrant blocks from the full-size image) while
+/// the pointer hovers it, half-blocks otherwise.
+fn render_artwork(
+    f: &mut ratatui::Frame<'_>,
+    app: &App,
+    thumb: &DynamicImage,
+    full_url: Option<&str>,
+    area: Rect,
+    bg: Color,
+    circular: bool,
+) {
+    let hovered = full_url.is_some() && app.image_preview.as_deref() == full_url;
+    if hovered {
+        let full = full_url.and_then(|u| {
+            if app.now_playing.as_ref().and_then(|n| n.album_art_url.as_deref()) == Some(u) {
+                app.cover_art.as_ref()
+            } else {
+                app.images.get(u).filter(|i| i.width() > 1)
+            }
+        });
+        render_image_fine(f, full.unwrap_or(thumb), area, bg, circular);
+    } else {
+        render_image(f, thumb, area, bg, circular);
+    }
+}
+
 fn quality_label(quality: AudioQuality) -> &'static str {
     match quality {
         AudioQuality::Kbps128 => "128 kbps",
@@ -262,54 +363,16 @@ pub fn render(
     if !app.right_panel_visible && app.active_panel == ActivePanel::Shortcuts {
         app.active_panel = ActivePanel::Main;
     }
-    render_sidebar(f, app, workspace[0], &p, &mut hits);
+    let art = render_sidebar(f, app, workspace[0], &p, &mut hits, use_true_image_protocol);
     render_main(f, app, workspace[1], &p, &mut hits);
     if right_width > 0 {
         render_right_panel(f, app, workspace[2], &p, &mut hits);
     }
-    let art = render_player_bar(f, app, root[1], &p, use_true_image_protocol, &mut hits);
+    render_player_bar(f, app, root[1], &p, &mut hits);
     render_loading_popup(f, app, workspace[1], &p);
-    render_image_preview(f, app, &p);
     render_context_menu(f, app, &p, &mut hits);
     app.clicks = hits;
     art
-}
-
-/// Large, finer rendering of the artwork under the mouse.
-fn render_image_preview(f: &mut ratatui::Frame<'_>, app: &App, p: &Palette) {
-    let Some(url) = app.image_preview.as_ref() else { return };
-    let now_cover = app.now_playing.as_ref().and_then(|n| n.album_art_url.as_deref()) == Some(url.as_str());
-    let img = if now_cover {
-        app.cover_art.as_ref()
-    } else {
-        app.images
-            .get(url)
-            .filter(|i| i.width() > 1)
-            .or_else(|| app.images.get(&url.replace("500x500", "250x250")).filter(|i| i.width() > 1))
-    };
-    let Some(img) = img else { return };
-    let screen = f.size();
-    let h = screen.height.saturating_sub(6).min(44);
-    let w = (h * 2).min(screen.width.saturating_sub(4));
-    let h = w / 2;
-    if h < 4 {
-        return;
-    }
-    let rect = Rect {
-        x: screen.x + (screen.width - (w + 2)) / 2,
-        y: screen.y + (screen.height - (h + 2)) / 2,
-        width: w + 2,
-        height: h + 2,
-    };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(p.accent))
-        .style(Style::default().bg(p.surface));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    render_image(f, img, inner, p.surface, false);
 }
 
 /// Right-click / `m` menu for a track, drawn at the pointer.
@@ -402,8 +465,20 @@ fn render_loading_popup(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &P
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 
-fn render_sidebar(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits) {
+/// Returns the rectangle where a terminal graphics protocol should draw the
+/// current cover (None when drawn as text or when nothing plays).
+fn render_sidebar(
+    f: &mut ratatui::Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    p: &Palette,
+    hits: &mut Hits,
+    use_true_image_protocol: bool,
+) -> Option<Rect> {
     let (playlists_pct, queue_pct) = SIDEBAR_SPLITS[app.config.sidebar_split % SIDEBAR_SPLITS.len()];
+    // Square-ish cover block (cells are about twice as tall as wide), shrunk
+    // or dropped on short terminals so the lists keep some room.
+    let cover_h: u16 = if area.height >= 46 { 16 } else if area.height >= 38 { 12 } else { 0 };
     let sidebar = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -411,9 +486,30 @@ fn render_sidebar(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pal
             Constraint::Length(12),
             Constraint::Ratio(playlists_pct as u32, 100),
             Constraint::Ratio(queue_pct as u32, 100),
+            Constraint::Length(cover_h),
             Constraint::Length(1),
         ])
         .split(area);
+    let mut protocol_rect = None;
+    if cover_h > 0 {
+        let block = panel(None, false, p);
+        let inner = block.inner(sidebar[4]);
+        f.render_widget(block, sidebar[4]);
+        // Keep the image square: centre a (2h × h) area inside the block.
+        let w = (inner.height * 2).min(inner.width);
+        let img_area = Rect { x: inner.x + (inner.width - w) / 2, y: inner.y, width: w, height: inner.height };
+        match (&app.cover_art, use_true_image_protocol) {
+            (Some(_), true) => protocol_rect = Some(img_area),
+            (Some(img), false) => render_image_fine(f, img, img_area, p.bg, false),
+            (None, _) => f.render_widget(
+                Paragraph::new("♪").alignment(Alignment::Center).style(Style::default().fg(p.dim)),
+                Rect { y: inner.y + inner.height / 2, height: 1, ..inner },
+            ),
+        }
+        if let Some(url) = app.now_playing.as_ref().and_then(|n| n.album_art_url.clone()) {
+            hit(hits, img_area, Hit::Image(url));
+        }
+    }
 
     // Wordmark
     // Hovering the wordmark lights it up; clicking it toggles Matugen / Deezer.
@@ -553,8 +649,9 @@ fn render_sidebar(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pal
     };
     f.render_widget(
         Paragraph::new(format!(" {}", app.status_message)).style(status_style),
-        sidebar[4],
+        sidebar[5],
     );
+    protocol_rect
 }
 
 // ── Main column ───────────────────────────────────────────────────────────────
@@ -962,8 +1059,9 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
     if let Some(url) = page.picture_url.as_ref() {
         hit(hits, photo_area, Hit::Image(full_size_url(url)));
     }
+    let photo_full = page.picture_url.as_deref().map(full_size_url);
     match page.picture_url.as_ref().and_then(|u| app.images.get(u)) {
-        Some(img) if img.width() > 1 => render_image(f, img, photo_area, p.bg, true),
+        Some(img) if img.width() > 1 => render_artwork(f, app, img, photo_full.as_deref(), photo_area, p.bg, true),
         _ => f.render_widget(
             Paragraph::new(vec![Line::from(""), Line::from(""), Line::from(""), Line::from(""), Line::from(""), Line::from("◯")])
                 .alignment(Alignment::Center)
@@ -1134,7 +1232,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
             hit(hits, img_area, Hit::Image(url.clone()));
         }
         match img {
-            Some(img) => render_image(f, img, img_area, p.bg, false),
+            Some(img) => render_artwork(f, app, img, preview_url.as_deref(), img_area, p.bg, false),
             None => f.render_widget(
                 Paragraph::new(vec![Line::from(""), Line::from(""), Line::from(""), Line::from(""), Line::from("♪")])
                     .alignment(Alignment::Center)
@@ -1214,7 +1312,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" MOUSE", muted(p).add_modifier(Modifier::BOLD))));
-    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("R-click", "Track menu"), ("Artwork", "Hover: preview"), ("Titles", "Resize lists"), ("Wheel", "Scroll / volume")] {
+    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("R-click", "Track menu"), ("Artwork", "Hover: sharpen"), ("Titles", "Resize lists"), ("Wheel", "Scroll / volume")] {
         lines.push(Line::from(vec![key_span(k, p), Span::styled(d.to_string(), Style::default().fg(p.fg))]));
     }
     lines.push(Line::from(""));
@@ -1252,9 +1350,8 @@ fn render_player_bar(
     app: &App,
     area: Rect,
     p: &Palette,
-    use_true_image_protocol: bool,
     hits: &mut Hits,
-) -> Option<Rect> {
+) {
     let player_bar = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(25), Constraint::Percentage(50), Constraint::Percentage(25)])
@@ -1269,41 +1366,12 @@ fn render_player_bar(
         Line::from(Span::styled(track_artist, muted(p))),
     ]);
 
-    // Left: cover art + title / artist
-    const ART_COLS: u16 = 12;
-    let show_art = app.cover_art.is_some() && player_bar[0].width > ART_COLS + 8;
-    let mut protocol_art_rect: Option<Rect> = None;
-    let mut info_area = player_bar[0];
-    if show_art {
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(ART_COLS), Constraint::Min(0)])
-            .split(player_bar[0]);
-        if use_true_image_protocol {
-            f.render_widget(panel(None, false, p), split[0]);
-            protocol_art_rect = Some(
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-                    .split(split[0])[1],
-            );
-        } else if let Some(img) = &app.cover_art {
-            render_image(f, img, split[0], p.bg, false);
-        }
-        if let Some(url) = app.now_playing.as_ref().and_then(|n| n.album_art_url.clone()) {
-            hit(hits, split[0], Hit::Image(url));
-        }
-        f.render_widget(
-            track_info.block(panel(None, false, p).padding(Padding::new(1, 1, 1, 0))),
-            split[1],
-        );
-        info_area = split[1];
-    } else {
-        f.render_widget(
-            track_info.block(panel(None, false, p).padding(Padding::new(1, 1, 1, 0))),
-            player_bar[0],
-        );
-    }
+    // Left: title / artist (the cover lives in the sidebar, bottom-left)
+    let info_area = player_bar[0];
+    f.render_widget(
+        track_info.block(panel(None, false, p).padding(Padding::new(1, 1, 1, 0))),
+        info_area,
+    );
     if let Some(now) = &app.now_playing {
         let inner = panel(None, false, p).padding(Padding::new(1, 1, 1, 0)).inner(info_area);
         hit(hits, Rect { height: 1, ..inner }, Hit::TrackAlbum(now.id.clone()));
@@ -1418,6 +1486,4 @@ fn render_player_bar(
     hit(hits, player_bar[2], Hit::Focus(ActivePanel::PlayerInfo));
     hit(hits, Rect { height: 1, ..info_inner }, Hit::VolumeField);
     hit(hits, Rect { y: info_inner.y + 1, height: 1, ..info_inner }, Hit::QualityField);
-
-    protocol_art_rect
 }

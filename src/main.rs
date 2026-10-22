@@ -107,6 +107,48 @@ enum ImageProtocol {
     Ueberzugpp,
 }
 
+/// Ask the terminal whether it speaks the kitty graphics protocol: send a
+/// tiny query image, then DA1 so that every terminal answers something and
+/// the wait ends quickly. Must run in raw mode, before the event loop reads.
+#[cfg(unix)]
+fn probe_kitty_graphics() -> bool {
+    let mut out = io::stdout();
+    if write!(out, "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c").is_err() || out.flush().is_err() {
+        return false;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(400);
+    let mut chunk = [0u8; 256];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        let ready = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as i32) };
+        if ready <= 0 {
+            break;
+        }
+        let n = unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        // The DA1 reply ("ESC [ ? ... c") always comes last.
+        if let Some(pos) = buf.windows(3).position(|w| w == b"\x1b[?") {
+            if buf[pos..].contains(&b'c') {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).contains("_Gi=31;OK")
+}
+
+#[cfg(not(unix))]
+fn probe_kitty_graphics() -> bool {
+    false
+}
+
 fn detect_image_protocol() -> ImageProtocol {
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
@@ -301,6 +343,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _stderr_silence = StderrSilenceGuard::activate()?;
 
     enable_raw_mode()?;
+    // Real images when the terminal supports them, coloured text blocks otherwise.
+    let kitty_graphics = probe_kitty_graphics();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
@@ -399,6 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut audio_task,
         &mut mpris_handle,
         &discord_rpc,
+        kitty_graphics,
     ).await;
 
     drop(app);
@@ -436,6 +481,7 @@ async fn run_tui_loop(
     audio_task: &mut Option<tokio::task::JoinHandle<()>>,
     mpris: &mut Option<MprisHandle>,
     discord_rpc: &DiscordRpcHandle,
+    kitty_graphics: bool,
 ) -> AnyResult<()> {
     let mut last_tick = Instant::now();
     let mut last_rpc_refresh = Instant::now();
@@ -443,7 +489,7 @@ async fn run_tui_loop(
     let mut last_click: Option<(Instant, Hit)> = None;
     let mut matugen = theme::MatugenWatcher::new();
     app.matugen = matugen.colors.clone();
-    let mut image_protocol = detect_image_protocol();
+    let mut image_protocol = if kitty_graphics { ImageProtocol::Kitty } else { detect_image_protocol() };
     let mut ueberzugpp_layer = match image_protocol {
         ImageProtocol::Ueberzugpp => UeberzugppLayer::start(),
         _ => None,
