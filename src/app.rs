@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
@@ -67,6 +68,8 @@ pub enum UiEvent {
     },
     /// Listening history fetched at startup (empty when unavailable).
     HistoryLoaded(Vec<HistoryEntry>),
+    /// A background request started (Some(label)) or finished (None).
+    Loading(Option<String>),
     ArtistLoaded(ArtistPage),
     AlbumLoaded(AlbumPage),
     FavoriteAlbumsLoaded(Vec<LibraryAlbum>),
@@ -134,6 +137,18 @@ impl ArtistRow {
 pub enum LibraryView {
     Albums,
     Artists,
+}
+
+/// What the main panel shows; kept in a history so Esc goes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewState {
+    /// A track list: Home, Explore, favorites or a playlist (its source id).
+    Tracks(Option<String>),
+    Album(String),
+    Artist(String),
+    Library(LibraryView),
+    Search,
+    Settings,
 }
 
 /// What a mouse click on a screen region means. Regions are recorded by the
@@ -286,6 +301,12 @@ pub struct App {
     pub current_album: Option<(String, String, String)>,
     /// Clickable regions of the last rendered frame.
     pub clicks: Vec<ClickRegion>,
+    /// Request in flight, shown as a popup after a short delay.
+    pub loading: Option<(String, Instant)>,
+    /// Previous views, most recent last (Esc pops one).
+    pub history: Vec<ViewState>,
+    /// Set while restoring a view from the history so it is not pushed again.
+    pub navigating_back: bool,
 }
 
 impl App {
@@ -355,6 +376,9 @@ impl App {
             pending_images: HashSet::new(),
             current_album: None,
             clicks: Vec::new(),
+            loading: None,
+            history: Vec::new(),
+            navigating_back: false,
         }
     }
 
@@ -606,6 +630,40 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    pub fn current_view(&self) -> ViewState {
+        if self.viewing_settings {
+            ViewState::Settings
+        } else if self.viewing_artist {
+            ViewState::Artist(self.artist_page.as_ref().map(|p| p.id.clone()).unwrap_or_default())
+        } else if let Some(view) = self.library_view {
+            ViewState::Library(view)
+        } else if self.showing_search_results {
+            ViewState::Search
+        } else if let Some(id) = self.current_playlist_id.as_deref().and_then(|s| s.strip_prefix("__album__:")) {
+            ViewState::Album(id.to_owned())
+        } else {
+            ViewState::Tracks(self.current_playlist_id.clone())
+        }
+    }
+
+    /// Push the current view onto the history before switching to `next`.
+    pub fn remember_view(&mut self, next: &ViewState) {
+        if self.navigating_back {
+            self.navigating_back = false;
+            return;
+        }
+        let current = self.current_view();
+        if current == *next || matches!(current, ViewState::Tracks(None)) && self.current_tracks.is_empty() {
+            return;
+        }
+        if self.history.last() != Some(&current) {
+            self.history.push(current);
+            if self.history.len() > 40 {
+                self.history.remove(0);
+            }
         }
     }
 

@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
 use crate::{
@@ -29,7 +29,8 @@ pub struct Palette {
 pub fn palette(theme: Theme) -> Palette {
     match theme {
         Theme::Deezer => Palette {
-            bg: Color::Rgb(14, 14, 16),
+            // Terminal background shows through (Alacritty opacity / niri blur).
+            bg: Color::Reset,
             surface: Color::Rgb(42, 42, 48),
             accent: Color::Rgb(162, 56, 255),
             fg: Color::Rgb(255, 255, 255),
@@ -238,7 +239,43 @@ pub fn render(
     }
     let art = render_player_bar(f, app, root[1], &p, use_true_image_protocol, &mut hits);
     app.clicks = hits;
+    render_loading_popup(f, app, workspace[1], &p);
     art
+}
+
+/// Small centered popup while a request is in flight. Appears after a short
+/// delay so cache hits and fast answers never flash it.
+fn render_loading_popup(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &Palette) {
+    let Some((label, started)) = &app.loading else { return };
+    let elapsed = started.elapsed().as_millis();
+    if elapsed < 120 {
+        return;
+    }
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame = FRAMES[(elapsed / 80) as usize % FRAMES.len()];
+    let width = (label.chars().count() as u16 + 10).clamp(24, area.width.saturating_sub(4).max(24));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(5) / 2,
+        width,
+        height: 5,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.surface));
+    let text = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{frame}  "), Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(label.clone(), Style::default().fg(p.fg).add_modifier(Modifier::BOLD)),
+        ]),
+    ])
+    .alignment(Alignment::Center)
+    .block(block);
+    f.render_widget(text, rect);
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -1000,9 +1037,9 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &Pal
                 } else if app.library_view.is_some() {
                     keys.extend([("Enter", "Open"), ("Esc", "Back")]);
                 } else if app.showing_search_results {
-                    keys.extend([("← →", "Category"), ("Enter", "Play / open")]);
+                    keys.extend([("← →", "Category"), ("Enter", "Play / open"), ("Esc", "Back")]);
                 } else {
-                    keys.extend([("Enter", "Play"), ("↑ ↓", "Move")]);
+                    keys.extend([("Enter", "Play"), ("↑ ↓", "Move"), ("Esc", "Back")]);
                 }
             }
             ActivePanel::Player => keys.extend([("← →", "Choose button"), ("Enter", "Activate"), ("↓", "Progress bar")]),
@@ -1030,7 +1067,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, p: &Pal
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" MOUSE", muted(p).add_modifier(Modifier::BOLD))));
-    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("Wheel", "Scroll list")] {
+    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("Wheel", "Scroll / volume")] {
         lines.push(Line::from(vec![key_span(k, p), Span::styled(d.to_string(), Style::default().fg(p.fg))]));
     }
     lines.push(Line::from(""));

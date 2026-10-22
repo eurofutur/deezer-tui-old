@@ -23,10 +23,12 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, Context, Result as AnyResult};
 use base64::Engine;
-use app::{ActivePanel, App, ArtistRow, Command, Hit, LibraryView, NowPlaying, RepeatMode, SearchCategory, UiEvent};
+use app::{ActivePanel, App, ArtistRow, Command, Hit, LibraryView, NowPlaying, RepeatMode, SearchCategory, UiEvent, ViewState};
 use std::collections::VecDeque;
 use config::{AudioQuality, Config};
-use api::HistoryEntry;
+use api::{AlbumPage, ArtistPage, ArtistRef, HistoryEntry, LibraryAlbum};
+use std::collections::HashMap;
+use std::sync::Arc;
 use state::PlaybackState;
 use discord_rpc::{DiscordPresence, DiscordRpcHandle};
 use crossterm::{
@@ -780,6 +782,9 @@ async fn run_tui_loop(
                 }
                 Event::Resize(_, _) => {
                     // Resize often cleans up stray lines, keep that behavior explicit.
+                    // Also re-assert the terminal modes: when the TUI is re-attached to a
+                    // new terminal (dtach), that terminal never saw them.
+                    let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
                     force_full_redraw = true;
                 }
                 _ => {}
@@ -853,14 +858,55 @@ async fn run_tui_loop(
                                 None => app.status_message = "Nothing is playing".into(),
                             }
                         }
-                        KeyCode::Esc if !app.is_searching && (app.viewing_artist || app.library_view.is_some()) => {
-                            app.leave_special_views();
-                            if !app.search_artists.is_empty() {
-                                app.showing_search_results = true;
-                                app.search_category = SearchCategory::Artists;
+                        KeyCode::Esc if !app.is_searching && !app.history.is_empty() => {
+                            if let Some(previous) = app.history.pop() {
+                                app.active_panel = ActivePanel::Main;
+                                app.navigating_back = true;
+                                match previous {
+                                    ViewState::Library(view) => {
+                                        app.navigating_back = false;
+                                        app.show_library(view);
+                                    }
+                                    ViewState::Settings => {
+                                        app.navigating_back = false;
+                                        app.leave_special_views();
+                                        app.showing_search_results = false;
+                                        app.viewing_settings = true;
+                                    }
+                                    ViewState::Search => {
+                                        app.navigating_back = false;
+                                        app.leave_special_views();
+                                        app.viewing_settings = false;
+                                        app.showing_search_results = true;
+                                        app.main_state.select(Some(0));
+                                    }
+                                    ViewState::Artist(id) => {
+                                        let _ = app.command_sender.send(Command::LoadArtist(id));
+                                    }
+                                    ViewState::Album(id) => {
+                                        let _ = app.command_sender.send(Command::LoadAlbum(id));
+                                    }
+                                    ViewState::Tracks(source) => {
+                                        let cmd = match source.as_deref() {
+                                            Some("__home__") => Command::LoadHome,
+                                            Some("__explore__") => Command::LoadExplore,
+                                            Some(id) if !id.is_empty() => {
+                                                app.current_playlist_id = Some(id.to_owned());
+                                                Command::LoadPlaylist(id.to_owned())
+                                            }
+                                            _ => Command::LoadFavorites,
+                                        };
+                                        if matches!(cmd, Command::LoadHome | Command::LoadExplore | Command::LoadFavorites) {
+                                            app.current_playlist_id = match cmd {
+                                                Command::LoadHome => Some("__home__".into()),
+                                                Command::LoadExplore => Some("__explore__".into()),
+                                                _ => None,
+                                            };
+                                        }
+                                        let _ = app.command_sender.send(cmd);
+                                    }
+                                }
                             }
-                            app.main_state.select(Some(0));
-                            app.active_panel = ActivePanel::Main;
                         }
                         KeyCode::Char('p') if !app.is_searching => {
                             if app.now_playing.is_none() {
@@ -1440,7 +1486,12 @@ async fn run_tui_loop(
                 UiEvent::HistoryLoaded(history) => {
                     apply_resume(app, &history);
                 }
+                UiEvent::Loading(label) => {
+                    app.loading = label.map(|l| (l, Instant::now()));
+                }
                 UiEvent::AlbumLoaded(album) => {
+                    app.loading = None;
+                    app.remember_view(&ViewState::Album(album.id.clone()));
                     app.status_message = format!("Album: {} · {} · {} tracks", album.title, album.artist, album.tracks.len());
                     app.current_tracks = album.tracks;
                     app.current_playlist_id = Some(format!("__album__:{}", album.id));
@@ -1454,15 +1505,21 @@ async fn run_tui_loop(
                     app.active_panel = ActivePanel::Main;
                 }
                 UiEvent::ArtistLoaded(page) => {
+                    app.loading = None;
+                    app.remember_view(&ViewState::Artist(page.id.clone()));
                     app.status_message = format!("Artist: {} · {} fans", page.name, app::fmt_count(page.nb_fan));
                     app.show_artist(page);
                 }
                 UiEvent::FavoriteAlbumsLoaded(albums) => {
+                    app.loading = None;
+                    app.remember_view(&ViewState::Library(LibraryView::Albums));
                     app.status_message = format!("{} albums in your library", albums.len());
                     app.library_albums = albums;
                     app.show_library(LibraryView::Albums);
                 }
                 UiEvent::FavoriteArtistsLoaded(artists) => {
+                    app.loading = None;
+                    app.remember_view(&ViewState::Library(LibraryView::Artists));
                     app.status_message = format!("{} artists in your library", artists.len());
                     app.library_artists = artists;
                     app.show_library(LibraryView::Artists);
@@ -1620,6 +1677,9 @@ async fn run_tui_loop(
                     }
                 }
                 UiEvent::Error(message) => {
+                    if !message.starts_with("Status:") {
+                        app.loading = None;
+                    }
                     let is_status_message = message.starts_with("Status:")
                         || message.contains("Loading")
                         || message.contains("Auth")
@@ -1702,6 +1762,8 @@ async fn run_tui_loop(
                     }
                 }
                 UiEvent::TracksLoaded(tracks) => {
+                    app.loading = None;
+                    app.remember_view(&ViewState::Tracks(app.current_playlist_id.clone()));
                     app.current_tracks = tracks;
                     app.showing_search_results = false;
                     app.leave_special_views();
@@ -1721,6 +1783,8 @@ async fn run_tui_loop(
                     playlists,
                     artists,
                 } => {
+                    app.loading = None;
+                    app.remember_view(&ViewState::Search);
                     app.current_tracks = tracks;
                     app.search_playlists = playlists;
                     app.search_artists = artists;
@@ -1843,6 +1907,39 @@ fn handle_mouse(
             }
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let up = m.kind == MouseEventKind::ScrollUp;
+            // Wheel over the volume field: adjust the volume. Over the progress bar: seek.
+            let target = app.clicks.iter().rev().find(|c| inside(c.rect)).map(|c| c.hit.clone());
+            match target {
+                Some(Hit::VolumeField) | Some(Hit::QualityField) => {
+                    app.active_panel = ActivePanel::PlayerInfo;
+                    app.player_info_index = 0;
+                    app.volume = if up { (app.volume + 5).min(100) } else { app.volume.saturating_sub(5) };
+                    let _ = app.command_sender.send(Command::SetVolume(app.volume));
+                    app.status_message = format!("Volume: {}%", app.volume);
+                    return;
+                }
+                Some(Hit::Progress) => {
+                    app.active_panel = ActivePanel::PlayerProgress;
+                    if let Some(now) = app.now_playing.as_ref() {
+                        if now.quality != AudioQuality::Flac {
+                            let seek_ms = if up {
+                                (now.current_ms + 5_000).min(now.total_ms.saturating_sub(1))
+                            } else {
+                                now.current_ms.saturating_sub(5_000)
+                            };
+                            let _ = app.command_sender.send(Command::PlayTrackAt {
+                                track_id: now.id.clone(),
+                                quality: now.quality,
+                                seek_ms,
+                            });
+                            app.status_message = format!("Seek: {}s", seek_ms / 1000);
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
             let panel = app
                 .clicks
                 .iter()
@@ -1960,10 +2057,129 @@ fn handle_mouse(
     }
 }
 
+/// Session-scoped cache of Deezer answers, shared by the API tasks. Pages are
+/// immutable enough for a listening session; images are cached in `App`.
+#[derive(Default)]
+struct ApiCache {
+    playlists: HashMap<String, Vec<(String, String, String)>>,
+    artists: HashMap<String, ArtistPage>,
+    albums: HashMap<String, AlbumPage>,
+    /// track id → (album id, artist id)
+    track_refs: HashMap<String, (Option<String>, Option<String>)>,
+    searches: HashMap<String, (Vec<(String, String, String)>, Vec<(String, String)>, Vec<(String, String)>)>,
+    library_albums: Option<Vec<LibraryAlbum>>,
+    library_artists: Option<Vec<ArtistRef>>,
+}
+
+const FAVORITES_KEY: &str = "__favorites__";
+
+type SharedCache = Arc<std::sync::Mutex<ApiCache>>;
+
+/// One authenticated Deezer client reused by every API task (authenticating
+/// used to cost a full round-trip per request), plus the shared cache.
+#[derive(Clone)]
+struct ApiCtx {
+    event_tx: mpsc::UnboundedSender<UiEvent>,
+    client: Arc<tokio::sync::Mutex<Option<api::DeezerClient>>>,
+    cache: SharedCache,
+}
+
+impl ApiCtx {
+    fn new(event_tx: mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self {
+            event_tx,
+            client: Arc::new(tokio::sync::Mutex::new(None)),
+            cache: Arc::new(std::sync::Mutex::new(ApiCache::default())),
+        }
+    }
+
+    async fn client(&self) -> AnyResult<api::DeezerClient> {
+        let mut guard = self.client.lock().await;
+        if guard.is_none() {
+            let mut client = api::DeezerClient::new(load_saved_arl()?)?;
+            client.fetch_api_token().await?;
+            *guard = Some(client);
+        }
+        Ok(guard.clone().expect("client just initialised"))
+    }
+
+    /// Run one API call in the background; the UI shows `label` meanwhile.
+    /// On failure the session is dropped so the next call re-authenticates.
+    fn run<F, Fut>(&self, label: &str, call: F)
+    where
+        F: FnOnce(api::DeezerClient, SharedCache) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = AnyResult<UiEvent>> + Send,
+    {
+        let _ = self.event_tx.send(UiEvent::Loading(Some(label.to_owned())));
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            let result: AnyResult<UiEvent> = async {
+                let client = ctx.client().await?;
+                call(client, ctx.cache.clone()).await
+            }
+            .await;
+            match result {
+                Ok(event) => {
+                    let _ = ctx.event_tx.send(event);
+                }
+                Err(err) => {
+                    *ctx.client.lock().await = None;
+                    let _ = ctx.event_tx.send(UiEvent::Error(format!("Error: {err}")));
+                }
+            }
+        });
+    }
+}
+
+async fn fetch_artist_cached(client: &api::DeezerClient, cache: &SharedCache, artist_id: &str) -> AnyResult<ArtistPage> {
+    if let Some(page) = cache.lock().unwrap().artists.get(artist_id).cloned() {
+        return Ok(page);
+    }
+    let page = client.fetch_artist_page(artist_id).await?;
+    cache.lock().unwrap().artists.insert(artist_id.to_owned(), page.clone());
+    Ok(page)
+}
+
+async fn fetch_album_cached(client: &api::DeezerClient, cache: &SharedCache, album_id: &str) -> AnyResult<AlbumPage> {
+    if let Some(album) = cache.lock().unwrap().albums.get(album_id).cloned() {
+        return Ok(album);
+    }
+    let album = client.fetch_album_page(album_id).await?;
+    {
+        let mut cache = cache.lock().unwrap();
+        for (track_id, _, _) in &album.tracks {
+            cache
+                .track_refs
+                .entry(track_id.clone())
+                .or_insert((Some(album.id.clone()), None))
+                .0
+                .get_or_insert(album.id.clone());
+        }
+        cache.albums.insert(album_id.to_owned(), album.clone());
+    }
+    Ok(album)
+}
+
+async fn track_refs_cached(
+    client: &api::DeezerClient,
+    cache: &SharedCache,
+    track_id: &str,
+) -> AnyResult<(Option<String>, Option<String>)> {
+    let known = cache.lock().unwrap().track_refs.get(track_id).cloned();
+    if let Some(refs @ (Some(_), Some(_))) = known {
+        return Ok(refs);
+    }
+    let meta = client.fetch_track_metadata(track_id).await?;
+    let refs = (meta.album_id.clone(), meta.artist_id.clone());
+    cache.lock().unwrap().track_refs.insert(track_id.to_owned(), refs.clone());
+    Ok(refs)
+}
+
 async fn audio_worker_loop(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<UiEvent>,
 ) {
+    let api = ApiCtx::new(event_tx.clone());
     let mut active_controls: Option<std::sync::mpsc::Sender<PlayerControl>> = None;
     let mut active_playback_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut current_volume: u16 = 100;
@@ -2153,299 +2369,164 @@ async fn audio_worker_loop(
                 }
             }
             Command::LoadPlaylist(playlist_id) => {
-                let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading tracks...".into()));
-                
-                tokio::spawn(async move {
-                    use api::DeezerClient;
-                    
-                    let arl = match load_saved_arl() {
-                        Ok(arl) => arl,
-                        Err(err) => {
-                            let _ = event_tx_for_task.send(UiEvent::Error(format!("Failed to load ARL: {}", err)));
-                            return;
-                        }
-                    };
-
-                    match DeezerClient::new(arl) {
-                        Ok(mut client) => {
-                            match client.fetch_api_token().await {
-                                Ok(_) => {
-                                    match client.fetch_playlist_tracks(&playlist_id).await {
-                                        Ok(tracks) => {
-                                            let _ = event_tx_for_task.send(UiEvent::TracksLoaded(tracks));
-                                        }
-                                        Err(err) => {
-                                            let _ = event_tx_for_task.send(UiEvent::Error(format!("Failed to load tracks: {}", err)));
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    let _ = event_tx_for_task.send(UiEvent::Error(format!("Failed to fetch API token: {}", err)));
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            let _ = event_tx_for_task.send(UiEvent::Error(format!("Failed to create client: {}", err)));
-                        }
+                let cached = api.cache.lock().unwrap().playlists.get(&playlist_id).cloned();
+                match cached {
+                    Some(tracks) => {
+                        let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
                     }
-                });
+                    None => api.run("Loading playlist…", move |client, cache| async move {
+                        let tracks = client.fetch_playlist_tracks(&playlist_id).await?;
+                        cache.lock().unwrap().playlists.insert(playlist_id, tracks.clone());
+                        Ok(UiEvent::TracksLoaded(tracks))
+                    }),
+                }
             }
             Command::LoadHome => {
-                let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading Home recommendations...".into()));
-
-                tokio::spawn(async move {
-                    use api::DeezerClient;
-
-                    let arl = match load_saved_arl() {
-                        Ok(arl) => arl,
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Failed to load ARL: {}", err)));
-                            return;
-                        }
-                    };
-
-                    match DeezerClient::new(arl) {
-                        Ok(mut client) => match client.fetch_api_token().await {
-                            Ok(_) => match client.fetch_home_tracks().await {
-                                Ok(tracks) => {
-                                    let _ = event_tx_for_task.send(UiEvent::TracksLoaded(tracks));
-                                }
-                                Err(err) => {
-                                    let err_text = err.to_string();
-                                    let needs_token_retry = {
-                                        let lower = err_text.to_lowercase();
-                                        lower.contains("csrf") || lower.contains("token")
-                                    };
-                                    if needs_token_retry {
-                                        match client.fetch_api_token().await {
-                                            Ok(_) => match client.fetch_home_tracks().await {
-                                                Ok(tracks) => {
-                                                    let _ = event_tx_for_task
-                                                        .send(UiEvent::TracksLoaded(tracks));
-                                                }
-                                                Err(retry_err) => {
-                                                    let _ = event_tx_for_task.send(UiEvent::Error(format!(
-                                                        "Home recommendations error: {}",
-                                                        retry_err
-                                                    )));
-                                                }
-                                            },
-                                            Err(refresh_err) => {
-                                                let _ = event_tx_for_task.send(UiEvent::Error(format!(
-                                                    "Home auth refresh error: {}",
-                                                    refresh_err
-                                                )));
-                                            }
-                                        }
-                                    } else {
-                                        let _ = event_tx_for_task.send(UiEvent::Error(format!(
-                                            "Home recommendations error: {}",
-                                            err_text
-                                        )));
-                                    }
-                                }
-                            },
-                            Err(err) => {
-                                let _ = event_tx_for_task
-                                    .send(UiEvent::Error(format!("Auth error: {}", err)));
-                            }
-                        },
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Client error: {}", err)));
-                        }
+                let cached = api.cache.lock().unwrap().playlists.get("__home__").cloned();
+                match cached {
+                    Some(tracks) => {
+                        let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
                     }
-                });
+                    None => api.run("Loading Home…", |client, cache| async move {
+                        let tracks = client.fetch_home_tracks().await?;
+                        cache.lock().unwrap().playlists.insert("__home__".to_owned(), tracks.clone());
+                        Ok(UiEvent::TracksLoaded(tracks))
+                    }),
+                }
             }
             Command::LoadExplore => {
-                let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading Explore recommendations...".into()));
-
-                tokio::spawn(async move {
-                    use api::DeezerClient;
-
-                    let arl = match load_saved_arl() {
-                        Ok(arl) => arl,
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Failed to load ARL: {}", err)));
-                            return;
-                        }
-                    };
-
-                    match DeezerClient::new(arl) {
-                        Ok(mut client) => match client.fetch_api_token().await {
-                            Ok(_) => match client.fetch_explore_tracks().await {
-                                Ok(tracks) => {
-                                    let _ = event_tx_for_task.send(UiEvent::TracksLoaded(tracks));
-                                }
-                                Err(err) => {
-                                    let err_text = err.to_string();
-                                    let needs_token_retry = {
-                                        let lower = err_text.to_lowercase();
-                                        lower.contains("csrf") || lower.contains("token")
-                                    };
-                                    if needs_token_retry {
-                                        match client.fetch_api_token().await {
-                                            Ok(_) => match client.fetch_explore_tracks().await {
-                                                Ok(tracks) => {
-                                                    let _ = event_tx_for_task
-                                                        .send(UiEvent::TracksLoaded(tracks));
-                                                }
-                                                Err(retry_err) => {
-                                                    let _ = event_tx_for_task.send(UiEvent::Error(format!(
-                                                        "Explore recommendations error: {}",
-                                                        retry_err
-                                                    )));
-                                                }
-                                            },
-                                            Err(refresh_err) => {
-                                                let _ = event_tx_for_task.send(UiEvent::Error(format!(
-                                                    "Explore auth refresh error: {}",
-                                                    refresh_err
-                                                )));
-                                            }
-                                        }
-                                    } else {
-                                        let _ = event_tx_for_task.send(UiEvent::Error(format!(
-                                            "Explore recommendations error: {}",
-                                            err_text
-                                        )));
-                                    }
-                                }
-                            },
-                            Err(err) => {
-                                let _ = event_tx_for_task
-                                    .send(UiEvent::Error(format!("Auth error: {}", err)));
-                            }
-                        },
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Client error: {}", err)));
-                        }
+                let cached = api.cache.lock().unwrap().playlists.get("__explore__").cloned();
+                match cached {
+                    Some(tracks) => {
+                        let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
                     }
-                });
+                    None => api.run("Loading Explore…", |client, cache| async move {
+                        let tracks = client.fetch_explore_tracks().await?;
+                        cache.lock().unwrap().playlists.insert("__explore__".to_owned(), tracks.clone());
+                        Ok(UiEvent::TracksLoaded(tracks))
+                    }),
+                }
             }
             Command::LoadFavorites => {
-                let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading favorites...".into()));
-
-                tokio::spawn(async move {
-                    use api::DeezerClient;
-
-                    let arl = match load_saved_arl() {
-                        Ok(arl) => arl,
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Failed to load ARL: {}", err)));
-                            return;
-                        }
-                    };
-
-                    match DeezerClient::new(arl) {
-                        Ok(mut client) => match client.fetch_api_token().await {
-                            Ok(_) => match client.fetch_favorite_tracks().await {
-                                Ok(tracks) => {
-                                    let _ = event_tx_for_task.send(UiEvent::TracksLoaded(tracks));
-                                }
-                                Err(err) => {
-                                    let _ = event_tx_for_task
-                                        .send(UiEvent::Error(format!("Favorites error: {}", err)));
-                                }
-                            },
-                            Err(err) => {
-                                let _ = event_tx_for_task
-                                    .send(UiEvent::Error(format!("Auth error: {}", err)));
-                            }
-                        },
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Client error: {}", err)));
-                        }
+                let cached = api.cache.lock().unwrap().playlists.get(FAVORITES_KEY).cloned();
+                match cached {
+                    Some(tracks) => {
+                        let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
                     }
-                });
+                    None => api.run("Loading favorite tracks…", |client, cache| async move {
+                        let tracks = client.fetch_favorite_tracks().await?;
+                        cache.lock().unwrap().playlists.insert(FAVORITES_KEY.to_owned(), tracks.clone());
+                        Ok(UiEvent::TracksLoaded(tracks))
+                    }),
+                }
             }
             Command::LoadArtist(artist_id) => {
-                spawn_api_task(&event_tx, "Status: Loading artist...", move |client| async move {
-                    Ok(UiEvent::ArtistLoaded(client.fetch_artist_page(&artist_id).await?))
-                });
+                let cached = api.cache.lock().unwrap().artists.get(&artist_id).cloned();
+                match cached {
+                    Some(page) => {
+                        let _ = event_tx.send(UiEvent::ArtistLoaded(page));
+                    }
+                    None => api.run("Loading artist…", move |client, cache| async move {
+                        Ok(UiEvent::ArtistLoaded(fetch_artist_cached(&client, &cache, &artist_id).await?))
+                    }),
+                }
             }
             Command::LoadAlbum(album_id) => {
-                spawn_api_task(&event_tx, "Status: Loading album...", move |client| async move {
-                    Ok(UiEvent::AlbumLoaded(client.fetch_album_page(&album_id).await?))
-                });
+                let cached = api.cache.lock().unwrap().albums.get(&album_id).cloned();
+                match cached {
+                    Some(album) => {
+                        let _ = event_tx.send(UiEvent::AlbumLoaded(album));
+                    }
+                    None => api.run("Loading album…", move |client, cache| async move {
+                        Ok(UiEvent::AlbumLoaded(fetch_album_cached(&client, &cache, &album_id).await?))
+                    }),
+                }
             }
             Command::OpenAlbumOfTrack(track_id) => {
-                spawn_api_task(&event_tx, "Status: Opening album...", move |client| async move {
-                    let meta = client.fetch_track_metadata(&track_id).await?;
-                    let album_id = meta.album_id.ok_or_else(|| anyhow!("this track has no album"))?;
-                    Ok(UiEvent::AlbumLoaded(client.fetch_album_page(&album_id).await?))
-                });
+                let cached = {
+                    let cache = api.cache.lock().unwrap();
+                    cache
+                        .track_refs
+                        .get(&track_id)
+                        .and_then(|(album_id, _)| album_id.clone())
+                        .and_then(|album_id| cache.albums.get(&album_id).cloned())
+                };
+                match cached {
+                    Some(album) => {
+                        let _ = event_tx.send(UiEvent::AlbumLoaded(album));
+                    }
+                    None => api.run("Opening album…", move |client, cache| async move {
+                        let (album_id, _) = track_refs_cached(&client, &cache, &track_id).await?;
+                        let album_id = album_id.ok_or_else(|| anyhow!("this track has no album"))?;
+                        Ok(UiEvent::AlbumLoaded(fetch_album_cached(&client, &cache, &album_id).await?))
+                    }),
+                }
             }
             Command::OpenArtistOfTrack(track_id) => {
-                spawn_api_task(&event_tx, "Status: Opening artist...", move |client| async move {
-                    let meta = client.fetch_track_metadata(&track_id).await?;
-                    let artist_id = meta.artist_id.ok_or_else(|| anyhow!("this track has no artist"))?;
-                    Ok(UiEvent::ArtistLoaded(client.fetch_artist_page(&artist_id).await?))
-                });
+                let cached = {
+                    let cache = api.cache.lock().unwrap();
+                    cache
+                        .track_refs
+                        .get(&track_id)
+                        .and_then(|(_, artist_id)| artist_id.clone())
+                        .and_then(|artist_id| cache.artists.get(&artist_id).cloned())
+                };
+                match cached {
+                    Some(page) => {
+                        let _ = event_tx.send(UiEvent::ArtistLoaded(page));
+                    }
+                    None => api.run("Opening artist…", move |client, cache| async move {
+                        let (_, artist_id) = track_refs_cached(&client, &cache, &track_id).await?;
+                        let artist_id = artist_id.ok_or_else(|| anyhow!("this track has no artist"))?;
+                        Ok(UiEvent::ArtistLoaded(fetch_artist_cached(&client, &cache, &artist_id).await?))
+                    }),
+                }
             }
             Command::LoadFavoriteAlbums => {
-                spawn_api_task(&event_tx, "Status: Loading your albums...", move |client| async move {
-                    let user_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
-                    Ok(UiEvent::FavoriteAlbumsLoaded(client.fetch_favorite_albums(&user_id).await?))
-                });
+                let cached = api.cache.lock().unwrap().library_albums.clone();
+                match cached {
+                    Some(albums) => {
+                        let _ = event_tx.send(UiEvent::FavoriteAlbumsLoaded(albums));
+                    }
+                    None => api.run("Loading your albums…", |client, cache| async move {
+                        let user_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
+                        let albums = client.fetch_favorite_albums(&user_id).await?;
+                        cache.lock().unwrap().library_albums = Some(albums.clone());
+                        Ok(UiEvent::FavoriteAlbumsLoaded(albums))
+                    }),
+                }
             }
             Command::LoadFavoriteArtists => {
-                spawn_api_task(&event_tx, "Status: Loading your artists...", move |client| async move {
-                    let user_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
-                    Ok(UiEvent::FavoriteArtistsLoaded(client.fetch_favorite_artists(&user_id).await?))
-                });
+                let cached = api.cache.lock().unwrap().library_artists.clone();
+                match cached {
+                    Some(artists) => {
+                        let _ = event_tx.send(UiEvent::FavoriteArtistsLoaded(artists));
+                    }
+                    None => api.run("Loading your artists…", |client, cache| async move {
+                        let user_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
+                        let artists = client.fetch_favorite_artists(&user_id).await?;
+                        cache.lock().unwrap().library_artists = Some(artists.clone());
+                        Ok(UiEvent::FavoriteArtistsLoaded(artists))
+                    }),
+                }
             }
             Command::Search(query) => {
-                let event_tx_for_task = event_tx.clone();
-                let query_clone = query.clone();
-
-                tokio::spawn(async move {
-                    use api::DeezerClient;
-
-                    let arl = match load_saved_arl() {
-                        Ok(arl) => arl,
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Failed to load ARL: {}", err)));
-                            return;
-                        }
-                    };
-
-                    match DeezerClient::new(arl) {
-                        Ok(mut client) => match client.fetch_api_token().await {
-                            Ok(_) => match client.fetch_search_results(&query_clone).await {
-                                Ok((tracks, playlists, artists)) => {
-                                    let _ = event_tx_for_task.send(UiEvent::SearchResultsLoaded {
-                                        tracks,
-                                        playlists,
-                                        artists,
-                                    });
-                                }
-                                Err(err) => {
-                                    let _ = event_tx_for_task
-                                        .send(UiEvent::Error(format!("Search error: {}", err)));
-                                }
-                            },
-                            Err(err) => {
-                                let _ = event_tx_for_task
-                                    .send(UiEvent::Error(format!("Auth error: {}", err)));
-                            }
-                        },
-                        Err(err) => {
-                            let _ = event_tx_for_task
-                                .send(UiEvent::Error(format!("Client error: {}", err)));
-                        }
+                let key = query.trim().to_lowercase();
+                let cached = api.cache.lock().unwrap().searches.get(&key).cloned();
+                match cached {
+                    Some((tracks, playlists, artists)) => {
+                        let _ = event_tx.send(UiEvent::SearchResultsLoaded { tracks, playlists, artists });
                     }
-                });
+                    None => api.run("Searching…", move |client, cache| async move {
+                        let (tracks, playlists, artists) = client.fetch_search_results(&query).await?;
+                        cache
+                            .lock()
+                            .unwrap()
+                            .searches
+                            .insert(key, (tracks.clone(), playlists.clone(), artists.clone()));
+                        Ok(UiEvent::SearchResultsLoaded { tracks, playlists, artists })
+                    }),
+                }
             }
             Command::SetQuality(quality) => {
                 current_quality = quality;
@@ -2481,34 +2562,6 @@ async fn audio_worker_loop(
     if let Some(handle) = active_playback_task.take() {
         let _ = handle.await;
     }
-}
-
-/// Run one authenticated Deezer API call on a background task and forward
-/// its resulting UI event (or an error status) to the UI loop.
-fn spawn_api_task<F, Fut>(event_tx: &mpsc::UnboundedSender<UiEvent>, status: &str, call: F)
-where
-    F: FnOnce(api::DeezerClient) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = AnyResult<UiEvent>> + Send,
-{
-    let tx = event_tx.clone();
-    let _ = tx.send(UiEvent::Error(status.to_owned()));
-    tokio::spawn(async move {
-        let result: AnyResult<UiEvent> = async {
-            let arl = load_saved_arl()?;
-            let mut client = api::DeezerClient::new(arl)?;
-            client.fetch_api_token().await?;
-            call(client).await
-        }
-        .await;
-        match result {
-            Ok(event) => {
-                let _ = tx.send(event);
-            }
-            Err(err) => {
-                let _ = tx.send(UiEvent::Error(format!("Error: {err}")));
-            }
-        }
-    });
 }
 
 async fn run_play_track_pipeline(
