@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
+
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
-use crate::api::HistoryEntry;
+use crate::api::{AlbumPage, ArtistPage, ArtistRef, HistoryEntry, LibraryAlbum};
 use crate::config::{AudioQuality, Config};
 use crate::state::PlaybackState;
 
@@ -26,6 +28,13 @@ pub enum Command {
     LoadHome,
     LoadExplore,
     LoadFavorites,
+    LoadFavoriteAlbums,
+    LoadFavoriteArtists,
+    LoadArtist(String),
+    LoadAlbum(String),
+    /// Resolve a track's album / artist from its metadata, then open it.
+    OpenAlbumOfTrack(String),
+    OpenArtistOfTrack(String),
     Search(String),
     Shutdown,
 }
@@ -40,6 +49,7 @@ pub enum UiEvent {
         id: String,
         title: String,
         artist: String,
+        artist_id: Option<String>,
         quality: AudioQuality,
         album_art_url: Option<String>,
         initial_ms: u64,
@@ -57,6 +67,120 @@ pub enum UiEvent {
     },
     /// Listening history fetched at startup (empty when unavailable).
     HistoryLoaded(Vec<HistoryEntry>),
+    ArtistLoaded(ArtistPage),
+    AlbumLoaded(AlbumPage),
+    FavoriteAlbumsLoaded(Vec<LibraryAlbum>),
+    FavoriteArtistsLoaded(Vec<ArtistRef>),
+}
+
+/// Tabs of the artist page, in Deezer's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtistTab {
+    Discography,
+    TopTracks,
+    Similar,
+    Playlists,
+    Bio,
+}
+
+impl ArtistTab {
+    pub const ALL: [ArtistTab; 5] = [
+        ArtistTab::Discography,
+        ArtistTab::TopTracks,
+        ArtistTab::Similar,
+        ArtistTab::Playlists,
+        ArtistTab::Bio,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ArtistTab::Discography => "Discography",
+            ArtistTab::TopTracks => "Top tracks",
+            ArtistTab::Similar => "Similar artists",
+            ArtistTab::Playlists => "Playlists",
+            ArtistTab::Bio => "Bio",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+/// One selectable (or header) line of the artist page body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtistRow {
+    PlayAll,
+    Header(&'static str),
+    Track(usize),
+    Album(usize),
+    Related(usize),
+    Playlist(usize),
+}
+
+impl ArtistRow {
+    pub fn selectable(&self) -> bool {
+        !matches!(self, ArtistRow::Header(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryView {
+    Albums,
+    Artists,
+}
+
+/// What a mouse click on a screen region means. Regions are recorded by the
+/// renderer each frame (`App::clicks`) and resolved in the event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hit {
+    Focus(ActivePanel),
+    SearchBar,
+    NavItem(usize),
+    PlaylistItem(usize),
+    QueueItem(usize),
+    /// A row of the main list. `opens` rows act on a single click (albums,
+    /// artists, playlists, settings); other rows select on click and act on
+    /// double-click (tracks).
+    MainRow { index: usize, opens: bool },
+    ArtistTab(ArtistTab),
+    SearchCategory(SearchCategory),
+    PlayerButton(usize),
+    Progress,
+    VolumeField,
+    QualityField,
+    /// Title of a track: opens its album. Artist name: opens the artist page.
+    TrackAlbum(String),
+    TrackArtist(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickRegion {
+    pub rect: ratatui::layout::Rect,
+    pub hit: Hit,
+}
+
+/// "23 159" style thousands grouping, as on Deezer's pages.
+pub fn fmt_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+pub fn fmt_duration(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +211,7 @@ pub struct NowPlaying {
     pub id: String,
     pub title: String,
     pub artist: String,
+    pub artist_id: Option<String>,
     pub quality: AudioQuality,
     pub current_ms: u64,
     pub total_ms: u64,
@@ -145,6 +270,22 @@ pub struct App {
     /// Snapshot from the previous session, consumed once resume has run.
     pub saved_state: Option<PlaybackState>,
     pub resume_done: bool,
+    /// Artist page (Deezer-style) shown in the main panel when `viewing_artist`.
+    pub artist_page: Option<ArtistPage>,
+    pub artist_tab: ArtistTab,
+    pub artist_rows: Vec<ArtistRow>,
+    pub viewing_artist: bool,
+    /// Library pages (Albums / Artists) shown in the main panel.
+    pub library_view: Option<LibraryView>,
+    pub library_albums: Vec<LibraryAlbum>,
+    pub library_artists: Vec<ArtistRef>,
+    /// Decoded thumbnails keyed by URL, shared by the artist page and the detail card.
+    pub images: HashMap<String, image::DynamicImage>,
+    pub pending_images: HashSet<String>,
+    /// Album currently listed in the main panel (id, title, artist), if any.
+    pub current_album: Option<(String, String, String)>,
+    /// Clickable regions of the last rendered frame.
+    pub clicks: Vec<ClickRegion>,
 }
 
 impl App {
@@ -203,6 +344,17 @@ impl App {
             cover_art_track_id: None,
             saved_state: None,
             resume_done: false,
+            artist_page: None,
+            artist_tab: ArtistTab::Discography,
+            artist_rows: vec![],
+            viewing_artist: false,
+            library_view: None,
+            library_albums: vec![],
+            library_artists: vec![],
+            images: HashMap::new(),
+            pending_images: HashSet::new(),
+            current_album: None,
+            clicks: Vec::new(),
         }
     }
 
@@ -210,7 +362,7 @@ impl App {
         match self.active_panel {
             ActivePanel::Navigation => {
                 let current = self.nav_state.selected().unwrap_or(0);
-                if current >= 3 {
+                if current >= 6 {
                     self.active_panel = ActivePanel::Playlists;
                     if !self.playlists.is_empty() {
                         self.playlist_state.select(Some(0));
@@ -252,6 +404,31 @@ impl App {
                 self.active_panel = ActivePanel::Main;
             }
             ActivePanel::Main => {
+                if self.viewing_artist {
+                    let current = self.main_state.selected().unwrap_or(0);
+                    if let Some(next) = self
+                        .artist_rows
+                        .iter()
+                        .enumerate()
+                        .skip(current + 1)
+                        .find(|(_, row)| row.selectable())
+                        .map(|(i, _)| i)
+                    {
+                        self.main_state.select(Some(next));
+                    }
+                    return;
+                }
+                if let Some(view) = self.library_view {
+                    let len = match view {
+                        LibraryView::Albums => self.library_albums.len(),
+                        LibraryView::Artists => self.library_artists.len(),
+                    };
+                    if len > 0 {
+                        let current = self.main_state.selected().unwrap_or(0);
+                        self.main_state.select(Some((current + 1).min(len - 1)));
+                    }
+                    return;
+                }
                 if self.viewing_settings {
                     let max = 5usize;
                     let current = self.settings_state.selected().unwrap_or(0);
@@ -307,14 +484,14 @@ impl App {
             ActivePanel::Playlists => {
                 if self.playlists.is_empty() {
                     self.active_panel = ActivePanel::Navigation;
-                    self.nav_state.select(Some(3));
+                    self.nav_state.select(Some(6));
                     return;
                 }
 
                 let current = self.playlist_state.selected().unwrap_or(0);
                 if current == 0 {
                     self.active_panel = ActivePanel::Navigation;
-                    self.nav_state.select(Some(3));
+                    self.nav_state.select(Some(6));
                 } else {
                     self.playlist_state.select(Some(current - 1));
                 }
@@ -327,6 +504,26 @@ impl App {
                 self.active_panel = ActivePanel::Navigation;
             }
             ActivePanel::Main => {
+                if self.viewing_artist {
+                    let current = self.main_state.selected().unwrap_or(0);
+                    match self.artist_rows[..current.min(self.artist_rows.len())]
+                        .iter()
+                        .rposition(|row| row.selectable())
+                    {
+                        Some(prev) => self.main_state.select(Some(prev)),
+                        None => self.active_panel = ActivePanel::Search,
+                    }
+                    return;
+                }
+                if self.library_view.is_some() {
+                    let current = self.main_state.selected().unwrap_or(0);
+                    if current == 0 {
+                        self.active_panel = ActivePanel::Search;
+                    } else {
+                        self.main_state.select(Some(current - 1));
+                    }
+                    return;
+                }
                 if self.viewing_settings {
                     let current = self.settings_state.selected().unwrap_or(0);
                     self.settings_state.select(Some(current.saturating_sub(1)));
@@ -381,7 +578,9 @@ impl App {
     pub fn handle_left(&mut self) {
         match self.active_panel {
             ActivePanel::Main => {
-                if self.showing_search_results {
+                if self.viewing_artist {
+                    self.artist_tab_prev();
+                } else if self.showing_search_results {
                     self.search_category = match self.search_category {
                         SearchCategory::Tracks => SearchCategory::Artists,
                         SearchCategory::Playlists => SearchCategory::Tracks,
@@ -408,6 +607,146 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Leave the artist / library pages (used when another view loads).
+    pub fn leave_special_views(&mut self) {
+        self.viewing_artist = false;
+        self.library_view = None;
+    }
+
+    pub fn show_artist(&mut self, page: ArtistPage) {
+        self.artist_page = Some(page);
+        self.artist_tab = ArtistTab::Discography;
+        self.viewing_artist = true;
+        self.library_view = None;
+        self.viewing_settings = false;
+        self.showing_search_results = false;
+        self.rebuild_artist_rows();
+        self.active_panel = ActivePanel::Main;
+    }
+
+    pub fn show_library(&mut self, view: LibraryView) {
+        self.library_view = Some(view);
+        self.viewing_artist = false;
+        self.viewing_settings = false;
+        self.showing_search_results = false;
+        self.main_state.select(Some(0));
+        self.active_panel = ActivePanel::Main;
+    }
+
+    pub fn rebuild_artist_rows(&mut self) {
+        let Some(page) = self.artist_page.as_ref() else {
+            self.artist_rows.clear();
+            return;
+        };
+        let mut rows = Vec::new();
+        match self.artist_tab {
+            ArtistTab::Discography => {
+                if !page.top_tracks.is_empty() {
+                    rows.push(ArtistRow::Header("Top tracks"));
+                    rows.extend((0..page.top_tracks.len().min(5)).map(ArtistRow::Track));
+                }
+                if !page.albums.is_empty() {
+                    rows.push(ArtistRow::Header("Discography"));
+                    rows.extend((0..page.albums.len()).map(ArtistRow::Album));
+                }
+            }
+            ArtistTab::TopTracks => {
+                if !page.top_tracks.is_empty() {
+                    rows.push(ArtistRow::PlayAll);
+                    rows.extend((0..page.top_tracks.len()).map(ArtistRow::Track));
+                }
+            }
+            ArtistTab::Similar => rows.extend((0..page.related.len()).map(ArtistRow::Related)),
+            ArtistTab::Playlists => rows.extend((0..page.playlists.len()).map(ArtistRow::Playlist)),
+            ArtistTab::Bio => {}
+        }
+        self.artist_rows = rows;
+        let first = self.artist_rows.iter().position(|r| r.selectable());
+        self.main_state.select(first);
+    }
+
+    pub fn artist_tab_next(&mut self) {
+        self.artist_tab = self.artist_tab.next();
+        self.rebuild_artist_rows();
+    }
+
+    pub fn artist_tab_prev(&mut self) {
+        self.artist_tab = self.artist_tab.prev();
+        self.rebuild_artist_rows();
+    }
+
+    pub fn selected_artist_row(&self) -> Option<&ArtistRow> {
+        self.artist_rows.get(self.main_state.selected()?)
+    }
+
+    /// What the right-hand detail card should show for the current selection:
+    /// (image url, title, subtitle).
+    pub fn selected_detail(&self) -> Option<(Option<String>, String, String)> {
+        if self.viewing_artist {
+            let page = self.artist_page.as_ref()?;
+            let fans = format!("{} fans", fmt_count(page.nb_fan));
+            return Some(match self.selected_artist_row() {
+                Some(ArtistRow::Track(i)) => {
+                    let t = page.top_tracks.get(*i)?;
+                    (
+                        t.cover_url.clone(),
+                        t.title.clone(),
+                        format!("{} · {}", t.artist, fmt_duration(t.duration_secs)),
+                    )
+                }
+                Some(ArtistRow::Album(i)) => {
+                    let a = page.albums.get(*i)?;
+                    let mut sub = a.kind.clone();
+                    if !a.year.is_empty() {
+                        if !sub.is_empty() {
+                            sub.push_str(" · ");
+                        }
+                        sub.push_str(&a.year);
+                    }
+                    (a.cover_url.clone(), a.title.clone(), sub)
+                }
+                Some(ArtistRow::Related(i)) => {
+                    let a = page.related.get(*i)?;
+                    (a.picture_url.clone(), a.name.clone(), format!("{} fans", fmt_count(a.nb_fan)))
+                }
+                Some(ArtistRow::Playlist(i)) => {
+                    let p = page.playlists.get(*i)?;
+                    (p.cover_url.clone(), p.title.clone(), format!("{} fans", fmt_count(p.nb_fan)))
+                }
+                _ => (page.picture_url.clone(), page.name.clone(), fans),
+            });
+        }
+        match self.library_view? {
+            LibraryView::Albums => {
+                let a = self.library_albums.get(self.main_state.selected()?)?;
+                let mut sub = a.artist.clone();
+                if !a.year.is_empty() {
+                    sub.push_str(" · ");
+                    sub.push_str(&a.year);
+                }
+                Some((a.cover_url.clone(), a.title.clone(), sub))
+            }
+            LibraryView::Artists => {
+                let a = self.library_artists.get(self.main_state.selected()?)?;
+                Some((a.picture_url.clone(), a.name.clone(), format!("{} fans", fmt_count(a.nb_fan))))
+            }
+        }
+    }
+
+    /// Image URLs the current screen wants decoded (downloaded lazily by main).
+    pub fn wanted_images(&self) -> Vec<String> {
+        let mut urls = Vec::new();
+        if self.viewing_artist {
+            if let Some(url) = self.artist_page.as_ref().and_then(|p| p.picture_url.clone()) {
+                urls.push(url);
+            }
+        }
+        if let Some((Some(url), _, _)) = self.selected_detail() {
+            urls.push(url);
+        }
+        urls
     }
 
     pub fn switch_search_category_right(&mut self) {

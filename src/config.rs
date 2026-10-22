@@ -2,8 +2,27 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
+    Deezer,
     SpotifyDark,
     NcmpcppBlue,
+}
+
+impl Theme {
+    pub fn next(self) -> Self {
+        match self {
+            Theme::Deezer => Theme::SpotifyDark,
+            Theme::SpotifyDark => Theme::NcmpcppBlue,
+            Theme::NcmpcppBlue => Theme::Deezer,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Deezer => "Deezer",
+            Theme::SpotifyDark => "Spotify Dark",
+            Theme::NcmpcppBlue => "ncmpcpp Blue",
+        }
+    }
 }
 
 #[repr(u8)]
@@ -55,7 +74,7 @@ fn default_true() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            theme: Theme::SpotifyDark,
+            theme: Theme::Deezer,
             crossfade_enabled: false,
             crossfade_duration_ms: 0,
             default_quality: AudioQuality::Kbps320,

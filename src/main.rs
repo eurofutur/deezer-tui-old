@@ -23,15 +23,16 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, Context, Result as AnyResult};
 use base64::Engine;
-use app::{ActivePanel, App, Command, NowPlaying, RepeatMode, SearchCategory, UiEvent};
-use config::{AudioQuality, Config, Theme};
+use app::{ActivePanel, App, ArtistRow, Command, Hit, LibraryView, NowPlaying, RepeatMode, SearchCategory, UiEvent};
+use std::collections::VecDeque;
+use config::{AudioQuality, Config};
 use api::HistoryEntry;
 use state::PlaybackState;
 use discord_rpc::{DiscordPresence, DiscordRpcHandle};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEvent,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -429,6 +430,7 @@ async fn run_tui_loop(
     let mut last_tick = Instant::now();
     let mut last_rpc_refresh = Instant::now();
     let mut last_state_save = Instant::now();
+    let mut last_click: Option<(Instant, Hit)> = None;
     let mut image_protocol = detect_image_protocol();
     let mut ueberzugpp_layer = match image_protocol {
         ImageProtocol::Ueberzugpp => UeberzugppLayer::start(),
@@ -444,6 +446,9 @@ async fn run_tui_loop(
     // Channel for background cover-art downloads.
     let (cover_tx, mut cover_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    // Generic thumbnails (artist photos, album covers) for the artist and library pages.
+    let (image_tx, mut image_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Option<image::DynamicImage>)>();
 
     'ui: loop {
         let elapsed = last_tick.elapsed();
@@ -678,6 +683,35 @@ async fn run_tui_loop(
             }
         }
 
+        // Decoded thumbnails arriving from background downloads.
+        while let Ok((url, img)) = image_rx.try_recv() {
+            app.pending_images.remove(&url);
+            if app.images.len() > 200 {
+                app.images.clear();
+            }
+            // A failed download gets a 1x1 placeholder so it is not retried every tick.
+            app.images.insert(url, img.unwrap_or_else(|| image::DynamicImage::new_rgb8(1, 1)));
+        }
+        for url in app.wanted_images() {
+            if app.images.contains_key(&url) || app.pending_images.contains(&url) {
+                continue;
+            }
+            app.pending_images.insert(url.clone());
+            let tx = image_tx.clone();
+            tokio::spawn(async move {
+                let img = match reqwest::get(&url).await {
+                    Ok(resp) => resp
+                        .bytes()
+                        .await
+                        .ok()
+                        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                        .map(|img| img.thumbnail(64, 64)),
+                    Err(_) => None,
+                };
+                let _ = tx.send((url, img));
+            });
+        }
+
         if force_full_redraw {
             terminal.clear()?;
             force_full_redraw = false;
@@ -733,14 +767,40 @@ async fn run_tui_loop(
             Duration::from_millis(50)
         })? {
             processed_input = true;
+            let mut pending_keys: VecDeque<(KeyCode, KeyModifiers)> = VecDeque::new();
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-
-                    match key.code {
-                        KeyCode::Char('q') => {
+                    pending_keys.push_back((key.code, key.modifiers));
+                }
+                Event::Mouse(mouse_event) => {
+                    handle_mouse(app, &mouse_event, &mut pending_keys, &mut last_click);
+                }
+                Event::Resize(_, _) => {
+                    // Resize often cleans up stray lines, keep that behavior explicit.
+                    force_full_redraw = true;
+                }
+                _ => {}
+            }
+            while let Some((code, mods)) = pending_keys.pop_front() {
+                    let in_search = app.is_searching || app.active_panel == ActivePanel::Search;
+                    match code {
+                        // Ctrl+Backspace clears the query (Alacritty and others send Ctrl+H).
+                        KeyCode::Backspace | KeyCode::Char('h') if in_search && mods.contains(KeyModifiers::CONTROL) => {
+                            app.search_query.clear();
+                        }
+                        // Alt+Backspace (or Ctrl+W) deletes the last word.
+                        KeyCode::Backspace | KeyCode::Char('w')
+                            if in_search && (mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL)) =>
+                        {
+                            let trimmed_len = app.search_query.trim_end().len();
+                            app.search_query.truncate(trimmed_len);
+                            let cut = app.search_query.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                            app.search_query.truncate(cut);
+                        }
+                        KeyCode::Char('q') if !in_search => {
                             persist_state(app);
                             discord_rpc.clear();
                             let _ = app.command_sender.send(Command::Shutdown);
@@ -771,10 +831,36 @@ async fn run_tui_loop(
                             app.search_query.clear();
                         }
                         KeyCode::Char('t') if !app.is_searching => {
-                            app.config.theme = match app.config.theme {
-                                Theme::SpotifyDark => Theme::NcmpcppBlue,
-                                Theme::NcmpcppBlue => Theme::SpotifyDark,
-                            };
+                            app.config.theme = app.config.theme.next();
+                            let _ = save_config(&app.config);
+                            app.status_message = format!("Theme: {}", app.config.theme.label());
+                        }
+                        KeyCode::Char('a') if !app.is_searching => {
+                            match app.now_playing.as_ref().map(|n| n.id.clone()) {
+                                Some(track_id) => {
+                                    app.status_message = "Opening artist...".into();
+                                    let _ = app.command_sender.send(Command::OpenArtistOfTrack(track_id));
+                                }
+                                None => app.status_message = "Nothing is playing".into(),
+                            }
+                        }
+                        KeyCode::Char('e') if !app.is_searching => {
+                            match app.now_playing.as_ref().map(|n| n.id.clone()) {
+                                Some(track_id) => {
+                                    app.status_message = "Opening album...".into();
+                                    let _ = app.command_sender.send(Command::OpenAlbumOfTrack(track_id));
+                                }
+                                None => app.status_message = "Nothing is playing".into(),
+                            }
+                        }
+                        KeyCode::Esc if !app.is_searching && (app.viewing_artist || app.library_view.is_some()) => {
+                            app.leave_special_views();
+                            if !app.search_artists.is_empty() {
+                                app.showing_search_results = true;
+                                app.search_category = SearchCategory::Artists;
+                            }
+                            app.main_state.select(Some(0));
+                            app.active_panel = ActivePanel::Main;
                         }
                         KeyCode::Char('p') if !app.is_searching => {
                             if app.now_playing.is_none() {
@@ -871,7 +957,9 @@ async fn run_tui_loop(
                             }
                         }
                         KeyCode::Right if !app.is_searching => {
-                            if app.active_panel == ActivePanel::Main && app.showing_search_results {
+                            if app.active_panel == ActivePanel::Main && app.viewing_artist {
+                                app.artist_tab_next();
+                            } else if app.active_panel == ActivePanel::Main && app.showing_search_results {
                                 app.switch_search_category_right();
                             } else if app.active_panel == ActivePanel::PlayerProgress {
                                 if let Some(now) = app.now_playing.as_ref() {
@@ -953,6 +1041,25 @@ async fn run_tui_loop(
                                             app.status_message = "Loading favorites...".into();
                                         }
                                         3 => {
+                                            app.active_panel = ActivePanel::Playlists;
+                                            if !app.playlists.is_empty() && app.playlist_state.selected().is_none() {
+                                                app.playlist_state.select(Some(0));
+                                            }
+                                        }
+                                        4 => {
+                                            app.command_sender
+                                                .send(Command::LoadFavoriteAlbums)
+                                                .map_err(|_| anyhow!("failed to send load albums command"))?;
+                                            app.status_message = "Loading your albums...".into();
+                                        }
+                                        5 => {
+                                            app.command_sender
+                                                .send(Command::LoadFavoriteArtists)
+                                                .map_err(|_| anyhow!("failed to send load artists command"))?;
+                                            app.status_message = "Loading your artists...".into();
+                                        }
+                                        6 => {
+                                            app.leave_special_views();
                                             app.viewing_settings = true;
                                             app.active_panel = ActivePanel::Main;
                                         }
@@ -1054,6 +1161,84 @@ async fn run_tui_loop(
                                                 _ => {}
                                             }
                                         }
+                                    } else if app.viewing_artist {
+                                        let row = app.selected_artist_row().cloned();
+                                        let page = app.artist_page.clone();
+                                        if let (Some(row), Some(page)) = (row, page) {
+                                            match row {
+                                                ArtistRow::PlayAll | ArtistRow::Track(_) => {
+                                                    let idx = if let ArtistRow::Track(i) = row { i } else { 0 };
+                                                    app.queue_tracks = page
+                                                        .top_tracks
+                                                        .iter()
+                                                        .map(|t| (t.id.clone(), t.title.clone(), t.artist.clone()))
+                                                        .collect();
+                                                    app.queue = app
+                                                        .queue_tracks
+                                                        .iter()
+                                                        .map(|(_, title, artist)| format!("{} - {}", title, artist))
+                                                        .collect();
+                                                    app.queue_index = Some(idx);
+                                                    app.queue_state.select(Some(idx));
+                                                    app.current_playlist_id = Some(format!("__artist__:{}", page.id));
+                                                    if let Some((track_id, _, _)) = app.queue_tracks.get(idx) {
+                                                        app.command_sender
+                                                            .send(Command::PlayTrack(track_id.clone()))
+                                                            .map_err(|_| anyhow!("failed to play artist track"))?;
+                                                        app.is_playing = true;
+                                                    }
+                                                }
+                                                ArtistRow::Album(i) => {
+                                                    if let Some(album) = page.albums.get(i) {
+                                                        app.current_playlist_id = Some(format!("__album__:{}", album.id));
+                                                        app.command_sender
+                                                            .send(Command::LoadAlbum(album.id.clone()))
+                                                            .map_err(|_| anyhow!("failed to load album"))?;
+                                                        app.status_message = format!("Loading album: {}", album.title);
+                                                    }
+                                                }
+                                                ArtistRow::Related(i) => {
+                                                    if let Some(artist) = page.related.get(i) {
+                                                        app.command_sender
+                                                            .send(Command::LoadArtist(artist.id.clone()))
+                                                            .map_err(|_| anyhow!("failed to load artist"))?;
+                                                        app.status_message = format!("Loading artist: {}", artist.name);
+                                                    }
+                                                }
+                                                ArtistRow::Playlist(i) => {
+                                                    if let Some(playlist) = page.playlists.get(i) {
+                                                        app.current_playlist_id = Some(playlist.id.clone());
+                                                        app.command_sender
+                                                            .send(Command::LoadPlaylist(playlist.id.clone()))
+                                                            .map_err(|_| anyhow!("failed to load playlist"))?;
+                                                        app.status_message = format!("Loading playlist: {}", playlist.title);
+                                                    }
+                                                }
+                                                ArtistRow::Header(_) => {}
+                                            }
+                                        }
+                                    } else if let Some(view) = app.library_view {
+                                        if let Some(idx) = app.main_state.selected() {
+                                            match view {
+                                                LibraryView::Albums => {
+                                                    if let Some(album) = app.library_albums.get(idx).cloned() {
+                                                        app.current_playlist_id = Some(format!("__album__:{}", album.id));
+                                                        app.command_sender
+                                                            .send(Command::LoadAlbum(album.id.clone()))
+                                                            .map_err(|_| anyhow!("failed to load album"))?;
+                                                        app.status_message = format!("Loading album: {}", album.title);
+                                                    }
+                                                }
+                                                LibraryView::Artists => {
+                                                    if let Some(artist) = app.library_artists.get(idx).cloned() {
+                                                        app.command_sender
+                                                            .send(Command::LoadArtist(artist.id.clone()))
+                                                            .map_err(|_| anyhow!("failed to load artist"))?;
+                                                        app.status_message = format!("Loading artist: {}", artist.name);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     } else if app.showing_search_results {
                                         if let Some(idx) = app.main_state.selected() {
                                             match app.search_category {
@@ -1102,11 +1287,11 @@ async fn run_tui_loop(
                                                 }
                                                 SearchCategory::Artists => {
                                                     if idx < app.search_artists.len() {
-                                                        let (_, name) = &app.search_artists[idx];
+                                                        let (artist_id, name) = app.search_artists[idx].clone();
                                                         app.command_sender
-                                                            .send(Command::Search(name.clone()))
-                                                            .map_err(|_| anyhow!("failed to search artist"))?;
-                                                        app.status_message = format!("Searching artist: {}", name);
+                                                            .send(Command::LoadArtist(artist_id))
+                                                            .map_err(|_| anyhow!("failed to load artist"))?;
+                                                        app.status_message = format!("Loading artist: {}", name);
                                                     }
                                                 }
                                             }
@@ -1247,13 +1432,6 @@ async fn run_tui_loop(
                         }
                         _ => {}
                     }
-                }
-                Event::Mouse(mouse_event) => handle_mouse_event(mouse_event),
-                Event::Resize(_, _) => {
-                    // Resize often cleans up stray lines, keep that behavior explicit.
-                    force_full_redraw = true;
-                }
-                _ => {}
             }
         }
 
@@ -1262,10 +1440,38 @@ async fn run_tui_loop(
                 UiEvent::HistoryLoaded(history) => {
                     apply_resume(app, &history);
                 }
+                UiEvent::AlbumLoaded(album) => {
+                    app.status_message = format!("Album: {} · {} · {} tracks", album.title, album.artist, album.tracks.len());
+                    app.current_tracks = album.tracks;
+                    app.current_playlist_id = Some(format!("__album__:{}", album.id));
+                    app.current_album = Some((album.id, album.title, album.artist));
+                    app.showing_search_results = false;
+                    app.search_playlists.clear();
+                    app.search_artists.clear();
+                    app.leave_special_views();
+                    app.viewing_settings = false;
+                    app.main_state.select(Some(0));
+                    app.active_panel = ActivePanel::Main;
+                }
+                UiEvent::ArtistLoaded(page) => {
+                    app.status_message = format!("Artist: {} · {} fans", page.name, app::fmt_count(page.nb_fan));
+                    app.show_artist(page);
+                }
+                UiEvent::FavoriteAlbumsLoaded(albums) => {
+                    app.status_message = format!("{} albums in your library", albums.len());
+                    app.library_albums = albums;
+                    app.show_library(LibraryView::Albums);
+                }
+                UiEvent::FavoriteArtistsLoaded(artists) => {
+                    app.status_message = format!("{} artists in your library", artists.len());
+                    app.library_artists = artists;
+                    app.show_library(LibraryView::Artists);
+                }
                 UiEvent::TrackChanged {
                     id,
                     title,
                     artist,
+                    artist_id,
                     quality,
                     album_art_url,
                     initial_ms,
@@ -1299,6 +1505,7 @@ async fn run_tui_loop(
                         id,
                         title,
                         artist,
+                        artist_id,
                         album_art_url,
                         quality,
                         current_ms: initial_ms,
@@ -1497,6 +1704,7 @@ async fn run_tui_loop(
                 UiEvent::TracksLoaded(tracks) => {
                     app.current_tracks = tracks;
                     app.showing_search_results = false;
+                    app.leave_special_views();
                     app.search_playlists.clear();
                     app.search_artists.clear();
                     if app.current_tracks.is_empty() {
@@ -1517,6 +1725,7 @@ async fn run_tui_loop(
                     app.search_playlists = playlists;
                     app.search_artists = artists;
                     app.showing_search_results = true;
+                    app.leave_special_views();
                     app.search_category = SearchCategory::Tracks;
                     app.main_state.select(Some(0));
                     app.viewing_settings = false;
@@ -1561,16 +1770,193 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> An
     Ok(())
 }
 
-fn handle_mouse_event(mouse_event: MouseEvent) {
-    match mouse_event.kind {
-        MouseEventKind::Down(_) => {}
-        MouseEventKind::Up(_) => {}
-        MouseEventKind::Drag(_) => {}
-        MouseEventKind::Moved => {}
-        MouseEventKind::ScrollDown => {}
-        MouseEventKind::ScrollUp => {}
-        MouseEventKind::ScrollLeft => {}
-        MouseEventKind::ScrollRight => {}
+/// Resolve a mouse event against the regions recorded by the last render.
+/// Actions that already exist as key handlers are queued as synthetic keys.
+fn handle_mouse(
+    app: &mut App,
+    m: &MouseEvent,
+    pending: &mut VecDeque<(KeyCode, KeyModifiers)>,
+    last_click: &mut Option<(Instant, Hit)>,
+) {
+    let inside = |r: ratatui::layout::Rect| {
+        m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
+    };
+    match m.kind {
+        MouseEventKind::Moved => {
+            // Focus follows the mouse: the panel under the cursor becomes active
+            // and the hovered row is selected. The search bar only takes focus on
+            // click, otherwise letters typed while hovering it would be swallowed.
+            if app.is_searching {
+                return;
+            }
+            let Some(region) = app.clicks.iter().rev().find(|c| inside(c.rect)).cloned() else {
+                return;
+            };
+            match region.hit {
+                Hit::Focus(panel) => app.active_panel = panel,
+                Hit::NavItem(i) => {
+                    app.active_panel = ActivePanel::Navigation;
+                    app.nav_state.select(Some(i));
+                }
+                Hit::PlaylistItem(i) => {
+                    app.active_panel = ActivePanel::Playlists;
+                    app.playlist_state.select(Some(i));
+                }
+                Hit::QueueItem(i) => {
+                    app.active_panel = ActivePanel::Queue;
+                    app.queue_state.select(Some(i));
+                }
+                Hit::MainRow { .. } | Hit::TrackAlbum(_) | Hit::TrackArtist(_) => {
+                    app.active_panel = ActivePanel::Main;
+                    if let Hit::MainRow { index, .. } = region.hit {
+                        if app.viewing_settings {
+                            app.settings_state.select(Some(index));
+                        } else {
+                            app.main_state.select(Some(index));
+                        }
+                    } else if let Some(row) = app
+                        .clicks
+                        .iter()
+                        .rev()
+                        .find(|c| inside(c.rect) && matches!(c.hit, Hit::MainRow { .. }))
+                    {
+                        if let Hit::MainRow { index, .. } = row.hit {
+                            app.main_state.select(Some(index));
+                        }
+                    }
+                }
+                Hit::ArtistTab(_) | Hit::SearchCategory(_) => app.active_panel = ActivePanel::Main,
+                Hit::PlayerButton(i) => {
+                    app.active_panel = ActivePanel::Player;
+                    app.player_button_index = i;
+                }
+                Hit::Progress => app.active_panel = ActivePanel::PlayerProgress,
+                Hit::VolumeField => {
+                    app.active_panel = ActivePanel::PlayerInfo;
+                    app.player_info_index = 0;
+                }
+                Hit::QualityField => {
+                    app.active_panel = ActivePanel::PlayerInfo;
+                    app.player_info_index = 1;
+                }
+                Hit::SearchBar => {}
+            }
+        }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let panel = app
+                .clicks
+                .iter()
+                .rev()
+                .filter(|c| matches!(c.hit, Hit::Focus(_)))
+                .find(|c| inside(c.rect))
+                .and_then(|c| if let Hit::Focus(p) = c.hit { Some(p) } else { None });
+            if let Some(panel) = panel {
+                app.active_panel = panel;
+                if m.kind == MouseEventKind::ScrollDown {
+                    app.handle_down();
+                } else {
+                    app.handle_up();
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(region) = app.clicks.iter().rev().find(|c| inside(c.rect)).cloned() else {
+                return;
+            };
+            let double = last_click
+                .as_ref()
+                .map(|(t, h)| t.elapsed() < Duration::from_millis(450) && *h == region.hit)
+                .unwrap_or(false);
+            *last_click = Some((Instant::now(), region.hit.clone()));
+            if !matches!(region.hit, Hit::SearchBar) {
+                app.is_searching = false;
+            }
+            match region.hit {
+                Hit::Focus(panel) => app.active_panel = panel,
+                Hit::SearchBar => {
+                    app.active_panel = ActivePanel::Search;
+                    app.is_searching = true;
+                }
+                Hit::NavItem(i) => {
+                    app.active_panel = ActivePanel::Navigation;
+                    app.nav_state.select(Some(i));
+                    pending.push_back((KeyCode::Enter, KeyModifiers::NONE));
+                }
+                Hit::PlaylistItem(i) => {
+                    app.active_panel = ActivePanel::Playlists;
+                    app.playlist_state.select(Some(i));
+                    pending.push_back((KeyCode::Enter, KeyModifiers::NONE));
+                }
+                Hit::QueueItem(i) => {
+                    app.active_panel = ActivePanel::Queue;
+                    app.queue_state.select(Some(i));
+                    pending.push_back((KeyCode::Enter, KeyModifiers::NONE));
+                }
+                Hit::MainRow { index, opens } => {
+                    app.active_panel = ActivePanel::Main;
+                    if app.viewing_settings {
+                        app.settings_state.select(Some(index));
+                        pending.push_back((KeyCode::Enter, KeyModifiers::NONE));
+                    } else {
+                        let same = app.main_state.selected() == Some(index);
+                        app.main_state.select(Some(index));
+                        if opens || (double && same) {
+                            pending.push_back((KeyCode::Enter, KeyModifiers::NONE));
+                        }
+                    }
+                }
+                Hit::ArtistTab(tab) => {
+                    app.active_panel = ActivePanel::Main;
+                    app.artist_tab = tab;
+                    app.rebuild_artist_rows();
+                }
+                Hit::SearchCategory(cat) => {
+                    app.active_panel = ActivePanel::Main;
+                    app.search_category = cat;
+                    app.main_state.select(Some(0));
+                }
+                Hit::PlayerButton(i) => {
+                    app.active_panel = ActivePanel::Player;
+                    app.player_button_index = i;
+                    pending.push_back((KeyCode::Enter, KeyModifiers::NONE));
+                }
+                Hit::Progress => {
+                    app.active_panel = ActivePanel::PlayerProgress;
+                    if let Some(now) = app.now_playing.as_ref() {
+                        if now.quality == AudioQuality::Flac {
+                            app.status_message = "FLAC seek is disabled".into();
+                        } else {
+                            let ratio = (m.column.saturating_sub(region.rect.x)) as f64
+                                / region.rect.width.max(1) as f64;
+                            let seek_ms = ((now.total_ms as f64) * ratio.clamp(0.0, 1.0)) as u64;
+                            let _ = app.command_sender.send(Command::PlayTrackAt {
+                                track_id: now.id.clone(),
+                                quality: now.quality,
+                                seek_ms,
+                            });
+                            app.status_message = format!("Seek: {}s", seek_ms / 1000);
+                        }
+                    }
+                }
+                Hit::VolumeField => {
+                    app.active_panel = ActivePanel::PlayerInfo;
+                    app.player_info_index = 0;
+                }
+                Hit::QualityField => {
+                    app.active_panel = ActivePanel::PlayerInfo;
+                    app.player_info_index = 1;
+                }
+                Hit::TrackAlbum(track_id) => {
+                    app.status_message = "Opening album...".into();
+                    let _ = app.command_sender.send(Command::OpenAlbumOfTrack(track_id));
+                }
+                Hit::TrackArtist(track_id) => {
+                    app.status_message = "Opening artist...".into();
+                    let _ = app.command_sender.send(Command::OpenArtistOfTrack(track_id));
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1982,6 +2368,42 @@ async fn audio_worker_loop(
                     }
                 });
             }
+            Command::LoadArtist(artist_id) => {
+                spawn_api_task(&event_tx, "Status: Loading artist...", move |client| async move {
+                    Ok(UiEvent::ArtistLoaded(client.fetch_artist_page(&artist_id).await?))
+                });
+            }
+            Command::LoadAlbum(album_id) => {
+                spawn_api_task(&event_tx, "Status: Loading album...", move |client| async move {
+                    Ok(UiEvent::AlbumLoaded(client.fetch_album_page(&album_id).await?))
+                });
+            }
+            Command::OpenAlbumOfTrack(track_id) => {
+                spawn_api_task(&event_tx, "Status: Opening album...", move |client| async move {
+                    let meta = client.fetch_track_metadata(&track_id).await?;
+                    let album_id = meta.album_id.ok_or_else(|| anyhow!("this track has no album"))?;
+                    Ok(UiEvent::AlbumLoaded(client.fetch_album_page(&album_id).await?))
+                });
+            }
+            Command::OpenArtistOfTrack(track_id) => {
+                spawn_api_task(&event_tx, "Status: Opening artist...", move |client| async move {
+                    let meta = client.fetch_track_metadata(&track_id).await?;
+                    let artist_id = meta.artist_id.ok_or_else(|| anyhow!("this track has no artist"))?;
+                    Ok(UiEvent::ArtistLoaded(client.fetch_artist_page(&artist_id).await?))
+                });
+            }
+            Command::LoadFavoriteAlbums => {
+                spawn_api_task(&event_tx, "Status: Loading your albums...", move |client| async move {
+                    let user_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
+                    Ok(UiEvent::FavoriteAlbumsLoaded(client.fetch_favorite_albums(&user_id).await?))
+                });
+            }
+            Command::LoadFavoriteArtists => {
+                spawn_api_task(&event_tx, "Status: Loading your artists...", move |client| async move {
+                    let user_id = client.user_id().ok_or_else(|| anyhow!("no user id"))?.to_owned();
+                    Ok(UiEvent::FavoriteArtistsLoaded(client.fetch_favorite_artists(&user_id).await?))
+                });
+            }
             Command::Search(query) => {
                 let event_tx_for_task = event_tx.clone();
                 let query_clone = query.clone();
@@ -2059,6 +2481,34 @@ async fn audio_worker_loop(
     if let Some(handle) = active_playback_task.take() {
         let _ = handle.await;
     }
+}
+
+/// Run one authenticated Deezer API call on a background task and forward
+/// its resulting UI event (or an error status) to the UI loop.
+fn spawn_api_task<F, Fut>(event_tx: &mpsc::UnboundedSender<UiEvent>, status: &str, call: F)
+where
+    F: FnOnce(api::DeezerClient) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = AnyResult<UiEvent>> + Send,
+{
+    let tx = event_tx.clone();
+    let _ = tx.send(UiEvent::Error(status.to_owned()));
+    tokio::spawn(async move {
+        let result: AnyResult<UiEvent> = async {
+            let arl = load_saved_arl()?;
+            let mut client = api::DeezerClient::new(arl)?;
+            client.fetch_api_token().await?;
+            call(client).await
+        }
+        .await;
+        match result {
+            Ok(event) => {
+                let _ = tx.send(event);
+            }
+            Err(err) => {
+                let _ = tx.send(UiEvent::Error(format!("Error: {err}")));
+            }
+        }
+    });
 }
 
 async fn run_play_track_pipeline(
@@ -2161,6 +2611,7 @@ async fn run_play_track_pipeline(
         id: metadata.id.clone(),
         title: metadata.title.clone(),
         artist: metadata.artist.clone(),
+        artist_id: metadata.artist_id.clone(),
         quality,
         album_art_url: metadata.album_art_url.clone(),
         initial_ms: if quality == AudioQuality::Flac { 0 } else { seek_ms },
@@ -2460,6 +2911,8 @@ fn apply_resume(app: &mut App, history: &[HistoryEntry]) {
         let cmd = match source {
             "__home__" => Some(Command::LoadHome),
             "__explore__" => Some(Command::LoadExplore),
+            s if s.starts_with("__album__:") => Some(Command::LoadAlbum(s["__album__:".len()..].to_owned())),
+            s if s.starts_with("__artist__:") => Some(Command::LoadArtist(s["__artist__:".len()..].to_owned())),
             id if !id.is_empty() => Some(Command::LoadPlaylist(id.to_owned())),
             _ => None,
         };

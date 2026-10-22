@@ -30,11 +30,142 @@ pub struct HistoryEntry {
     pub ts: u64,
 }
 
+pub fn cover_url(hash: &str, size: u32) -> Option<String> {
+    (!hash.is_empty()).then(|| {
+        format!("https://e-cdns-images.dzcdn.net/images/cover/{hash}/{size}x{size}-000000-80-0-0.jpg")
+    })
+}
+
+pub fn artist_picture_url(hash: &str, size: u32) -> Option<String> {
+    (!hash.is_empty()).then(|| {
+        format!("https://e-cdns-images.dzcdn.net/images/artist/{hash}/{size}x{size}-000000-80-0-0.jpg")
+    })
+}
+
+fn picture_url(kind: &str, hash: &str, size: u32) -> Option<String> {
+    (!hash.is_empty()).then(|| {
+        format!("https://e-cdns-images.dzcdn.net/images/{kind}/{hash}/{size}x{size}-000000-80-0-0.jpg")
+    })
+}
+
+/// Deezer sends ids either as strings or as numbers depending on the endpoint.
+fn str_or_num(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+}
+
+fn num(value: &Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0)
+}
+
+fn year_of(value: &Value) -> String {
+    value
+        .as_str()
+        .filter(|s| s.len() >= 4)
+        .map(|s| s[..4].to_owned())
+        .unwrap_or_default()
+}
+
+fn strip_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&nbsp;", " ")
+        .trim()
+        .to_owned()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtistTrack {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration_secs: u64,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtistAlbum {
+    pub id: String,
+    pub title: String,
+    pub year: String,
+    pub kind: String,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtistRef {
+    pub id: String,
+    pub name: String,
+    pub nb_fan: u64,
+    pub picture_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistRef {
+    pub id: String,
+    pub title: String,
+    pub nb_fan: u64,
+    pub cover_url: Option<String>,
+}
+
+/// Everything shown on an artist page (mirrors Deezer's own artist view).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtistPage {
+    pub id: String,
+    pub name: String,
+    pub nb_fan: u64,
+    pub picture_url: Option<String>,
+    pub top_tracks: Vec<ArtistTrack>,
+    pub albums: Vec<ArtistAlbum>,
+    pub related: Vec<ArtistRef>,
+    pub playlists: Vec<PlaylistRef>,
+    pub bio: String,
+    pub latest_release: Option<String>,
+}
+
+/// An album with its track list (gateway `deezer.pageAlbum`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlbumPage {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub artist_id: Option<String>,
+    pub cover_url: Option<String>,
+    pub tracks: Vec<(String, String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryAlbum {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub year: String,
+    pub cover_url: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrackMetadata {
     pub id: String,
     pub title: String,
     pub artist: String,
+    pub artist_id: Option<String>,
+    pub album_id: Option<String>,
     pub track_token: String,
     pub duration_secs: Option<u64>,
     pub album_art_url: Option<String>,
@@ -212,6 +343,8 @@ impl DeezerClient {
                 .to_owned(),
             title,
             artist,
+            artist_id: str_or_num(&result["ART_ID"]),
+            album_id: str_or_num(&result["ALB_ID"]),
             track_token,
             duration_secs,
             album_art_url,
@@ -317,6 +450,8 @@ impl DeezerClient {
                         .as_str()
                         .and_then(|s| s.parse().ok())
                         .or_else(|| track["DURATION"].as_u64()),
+                    artist_id: str_or_num(&track["ART_ID"]),
+                    album_id: str_or_num(&track["ALB_ID"]),
                     album_art_url: track["ALB_PICTURE"]
                         .as_str()
                         .filter(|s| !s.is_empty())
@@ -396,6 +531,233 @@ impl DeezerClient {
             .context("failed to decode Deezer gateway response")?;
 
         Ok((response, text))
+    }
+
+    /// POST to the gateway with the session cookie, like the page* calls above.
+    async fn gw_post(&self, method: &str, payload: Value) -> Result<Value> {
+        let api_token = self
+            .api_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("api token not loaded; call fetch_api_token first"))?;
+        let json = self
+            .http
+            .post(format!(
+                "{GATEWAY_URL}?method={method}&api_version=1.0&api_token={api_token}"
+            ))
+            .query(&[("input", "3")])
+            .header(
+                reqwest::header::COOKIE,
+                format!("arl={}; sid={}", self.arl, self.session_id),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("gateway request failed for {method}"))?
+            .error_for_status()
+            .with_context(|| format!("gateway returned error for {method}"))?
+            .json::<Value>()
+            .await
+            .with_context(|| format!("failed to decode {method} response"))?;
+        if let Some(err) = json.get("error").and_then(|e| e.as_object()).filter(|e| !e.is_empty()) {
+            return Err(anyhow!("gateway error for {method}: {}", Value::Object(err.clone())));
+        }
+        Ok(json)
+    }
+
+    /// Artist page: header data, top tracks, discography, similar artists,
+    /// related playlists and biography (gateway `deezer.pageArtist`).
+    pub async fn fetch_artist_page(&self, artist_id: &str) -> Result<ArtistPage> {
+        let json = self
+            .gw_post("deezer.pageArtist", json!({ "ART_ID": artist_id, "LANG": "en", "tab": 0 }))
+            .await?;
+        let r = &json["results"];
+        let data = &r["DATA"];
+
+        let top_tracks = r["TOP"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| {
+                Some(ArtistTrack {
+                    id: str_or_num(&t["SNG_ID"])?,
+                    title: t["SNG_TITLE"].as_str()?.to_owned(),
+                    artist: t["ART_NAME"].as_str().unwrap_or("Unknown artist").to_owned(),
+                    duration_secs: num(&t["DURATION"]),
+                    cover_url: t["ALB_PICTURE"].as_str().and_then(|h| cover_url(h, 250)),
+                })
+            })
+            .collect();
+
+        let albums = r["ALBUMS"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| {
+                let date = [&a["ORIGINAL_RELEASE_DATE"], &a["PHYSICAL_RELEASE_DATE"], &a["DIGITAL_RELEASE_DATE"]]
+                    .into_iter()
+                    .map(year_of)
+                    .find(|y| !y.is_empty())
+                    .unwrap_or_default();
+                let kind = match str_or_num(&a["TYPE"]).as_deref() {
+                    Some("0") => "Single",
+                    Some("1") => "Album",
+                    Some("2") => "Compilation",
+                    Some("3") => "EP",
+                    _ => "",
+                };
+                Some(ArtistAlbum {
+                    id: str_or_num(&a["ALB_ID"])?,
+                    title: a["ALB_TITLE"].as_str()?.to_owned(),
+                    year: date,
+                    kind: kind.to_owned(),
+                    cover_url: a["ALB_PICTURE"].as_str().and_then(|h| cover_url(h, 250)),
+                })
+            })
+            .collect();
+
+        let related = r["RELATED_ARTISTS"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| {
+                Some(ArtistRef {
+                    id: str_or_num(&a["ART_ID"])?,
+                    name: a["ART_NAME"].as_str()?.to_owned(),
+                    nb_fan: num(&a["NB_FAN"]),
+                    picture_url: a["ART_PICTURE"].as_str().and_then(|h| artist_picture_url(h, 250)),
+                })
+            })
+            .collect();
+
+        let playlists = r["RELATED_PLAYLIST"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| {
+                let kind = p["PICTURE_TYPE"].as_str().unwrap_or("playlist");
+                Some(PlaylistRef {
+                    id: str_or_num(&p["PLAYLIST_ID"])?,
+                    title: p["TITLE"].as_str()?.to_owned(),
+                    nb_fan: num(&p["NB_FAN"]),
+                    cover_url: p["PLAYLIST_PICTURE"].as_str().and_then(|h| picture_url(kind, h, 250)),
+                })
+            })
+            .collect();
+
+        let bio_raw = r["BIO"]["BIO"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| r["BIO"]["RESUME"].as_str())
+            .unwrap_or("");
+
+        let latest_release = if r["HIGHLIGHT"]["TYPE"].as_str() == Some("album") {
+            let item = &r["HIGHLIGHT"]["ITEM"];
+            item["ALB_TITLE"].as_str().map(|t| {
+                let year = year_of(&item["ORIGINAL_RELEASE_DATE"]);
+                if year.is_empty() { t.to_owned() } else { format!("{t} ({year})") }
+            })
+        } else {
+            None
+        };
+
+        Ok(ArtistPage {
+            id: str_or_num(&data["ART_ID"]).unwrap_or_else(|| artist_id.to_owned()),
+            name: data["ART_NAME"].as_str().unwrap_or("Unknown artist").to_owned(),
+            nb_fan: num(&data["NB_FAN"]),
+            picture_url: data["ART_PICTURE"].as_str().and_then(|h| artist_picture_url(h, 250)),
+            top_tracks,
+            albums,
+            related,
+            playlists,
+            bio: strip_html(bio_raw),
+            latest_release,
+        })
+    }
+
+    /// Album header and track list (gateway `deezer.pageAlbum`).
+    pub async fn fetch_album_page(&self, album_id: &str) -> Result<AlbumPage> {
+        let json = self
+            .gw_post(
+                "deezer.pageAlbum",
+                json!({ "ALB_ID": album_id, "LANG": "en", "header": true, "tab": 0 }),
+            )
+            .await?;
+        let data = &json["results"]["DATA"];
+        let tracks = json["results"]["SONGS"]["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| {
+                Some((
+                    str_or_num(&t["SNG_ID"])?,
+                    t["SNG_TITLE"].as_str()?.to_owned(),
+                    t["ART_NAME"].as_str().unwrap_or("Unknown artist").to_owned(),
+                ))
+            })
+            .collect();
+        Ok(AlbumPage {
+            id: str_or_num(&data["ALB_ID"]).unwrap_or_else(|| album_id.to_owned()),
+            title: data["ALB_TITLE"].as_str().unwrap_or("Album").to_owned(),
+            artist: data["ART_NAME"].as_str().unwrap_or("Unknown artist").to_owned(),
+            artist_id: str_or_num(&data["ART_ID"]),
+            cover_url: data["ALB_PICTURE"].as_str().and_then(|h| cover_url(h, 250)),
+            tracks,
+        })
+    }
+
+    async fn fetch_profile_tab(&self, user_id: &str, tab: &str, nb: usize) -> Result<Vec<Value>> {
+        let profile_id = self
+            .user_id
+            .as_deref()
+            .unwrap_or(user_id)
+            .parse::<u64>()
+            .unwrap_or(0);
+        let json = self
+            .gw_post(
+                "deezer.pageProfile",
+                json!({ "profile_id": profile_id, "user_id": profile_id, "USER_ID": profile_id, "tab": tab, "nb": nb }),
+            )
+            .await?;
+        Ok(json["results"]["TAB"][tab]["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Albums the user added to their library.
+    pub async fn fetch_favorite_albums(&self, user_id: &str) -> Result<Vec<LibraryAlbum>> {
+        Ok(self
+            .fetch_profile_tab(user_id, "albums", 500)
+            .await?
+            .iter()
+            .filter_map(|a| {
+                Some(LibraryAlbum {
+                    id: str_or_num(&a["ALB_ID"])?,
+                    title: a["ALB_TITLE"].as_str()?.to_owned(),
+                    artist: a["ART_NAME"].as_str().unwrap_or("Unknown artist").to_owned(),
+                    year: year_of(&a["PHYSICAL_RELEASE_DATE"]),
+                    cover_url: a["ALB_PICTURE"].as_str().and_then(|h| cover_url(h, 250)),
+                })
+            })
+            .collect())
+    }
+
+    /// Artists the user follows.
+    pub async fn fetch_favorite_artists(&self, user_id: &str) -> Result<Vec<ArtistRef>> {
+        Ok(self
+            .fetch_profile_tab(user_id, "artists", 500)
+            .await?
+            .iter()
+            .filter_map(|a| {
+                Some(ArtistRef {
+                    id: str_or_num(&a["ART_ID"])?,
+                    name: a["ART_NAME"].as_str()?.to_owned(),
+                    nb_fan: num(&a["NB_FAN"]),
+                    picture_url: a["ART_PICTURE"].as_str().and_then(|h| artist_picture_url(h, 250)),
+                })
+            })
+            .collect())
     }
 
     /// Fetch the account's listening history ("Just heard"), most recent first.
