@@ -15,6 +15,31 @@ use crate::{
 };
 
 use image::DynamicImage;
+use std::sync::Arc;
+
+/// An artwork to be drawn by the terminal's graphics protocol after the frame.
+pub struct ProtocolImage {
+    /// Stable slot (0 = sidebar cover, 1 = detail card, 2 = artist photo).
+    pub slot: usize,
+    /// Identity of the picture (track id or url): redrawn only when it changes.
+    pub key: String,
+    pub rect: Rect,
+    pub png: Arc<Vec<u8>>,
+}
+
+pub const SIDEBAR_COVER_SLOT: usize = 0;
+pub const DETAIL_SLOT: usize = 1;
+pub const ARTIST_PHOTO_SLOT: usize = 2;
+
+/// PNG bytes (and identity key) for a full-size artwork url, when available.
+fn protocol_png(app: &App, full_url: &str) -> Option<(String, Arc<Vec<u8>>)> {
+    if let Some(now) = app.now_playing.as_ref() {
+        if now.album_art_url.as_deref() == Some(full_url) {
+            return app.cover_art_png.clone().map(|png| (now.id.clone(), png));
+        }
+    }
+    app.images_png.get(full_url).cloned().map(|png| (full_url.to_owned(), png))
+}
 
 /// Colour roles for a theme.
 pub struct Palette {
@@ -207,8 +232,19 @@ fn render_artwork(
     area: Rect,
     bg: Color,
     circular: bool,
+    slot: usize,
+    protos: &mut Vec<ProtocolImage>,
 ) {
     let hovered = full_url.is_some() && app.image_preview.as_deref() == full_url;
+    // Pixel look by default; while hovered, the real picture is laid over the
+    // cells by the terminal's graphics protocol (or sharpened as text without one).
+    if hovered && app.true_images {
+        if let Some((key, png)) = full_url.and_then(|u| protocol_png(app, u)) {
+            render_image(f, thumb, area, bg, circular);
+            protos.push(ProtocolImage { slot, key, rect: area, png });
+            return;
+        }
+    }
     if hovered {
         let full = full_url.and_then(|u| {
             if app.now_playing.as_ref().and_then(|n| n.album_art_url.as_deref()) == Some(u) {
@@ -343,8 +379,10 @@ pub fn render(
     f: &mut ratatui::Frame<'_>,
     app: &mut App,
     use_true_image_protocol: bool,
-) -> Option<Rect> {
+) -> Vec<ProtocolImage> {
     let p = palette(app.config.theme, app.matugen.as_ref());
+    app.true_images = use_true_image_protocol;
+    let mut protos: Vec<ProtocolImage> = Vec::new();
     f.render_widget(Block::default().style(Style::default().bg(p.bg).fg(p.fg)), f.size());
 
     let root = Layout::default()
@@ -363,16 +401,16 @@ pub fn render(
     if !app.right_panel_visible && app.active_panel == ActivePanel::Shortcuts {
         app.active_panel = ActivePanel::Main;
     }
-    let art = render_sidebar(f, app, workspace[0], &p, &mut hits, use_true_image_protocol);
-    render_main(f, app, workspace[1], &p, &mut hits);
+    render_sidebar(f, app, workspace[0], &p, &mut hits, &mut protos);
+    render_main(f, app, workspace[1], &p, &mut hits, &mut protos);
     if right_width > 0 {
-        render_right_panel(f, app, workspace[2], &p, &mut hits);
+        render_right_panel(f, app, workspace[2], &p, &mut hits, &mut protos);
     }
     render_player_bar(f, app, root[1], &p, &mut hits);
     render_loading_popup(f, app, workspace[1], &p);
     render_context_menu(f, app, &p, &mut hits);
     app.clicks = hits;
-    art
+    protos
 }
 
 /// Right-click / `m` menu for a track, drawn at the pointer.
@@ -473,8 +511,8 @@ fn render_sidebar(
     area: Rect,
     p: &Palette,
     hits: &mut Hits,
-    use_true_image_protocol: bool,
-) -> Option<Rect> {
+    protos: &mut Vec<ProtocolImage>,
+) {
     let (playlists_pct, queue_pct) = SIDEBAR_SPLITS[app.config.sidebar_split % SIDEBAR_SPLITS.len()];
     // Square-ish cover block (cells are about twice as tall as wide), shrunk
     // or dropped on short terminals so the lists keep some room.
@@ -490,7 +528,6 @@ fn render_sidebar(
             Constraint::Length(1),
         ])
         .split(area);
-    let mut protocol_rect = None;
     if cover_h > 0 {
         let block = panel(None, false, p);
         let inner = block.inner(sidebar[4]);
@@ -498,10 +535,18 @@ fn render_sidebar(
         // Keep the image square: centre a (2h × h) area inside the block.
         let w = (inner.height * 2).min(inner.width);
         let img_area = Rect { x: inner.x + (inner.width - w) / 2, y: inner.y, width: w, height: inner.height };
-        match (&app.cover_art, use_true_image_protocol) {
-            (Some(_), true) => protocol_rect = Some(img_area),
-            (Some(img), false) => render_image_fine(f, img, img_area, p.bg, false),
-            (None, _) => f.render_widget(
+        let now_key = app.now_playing.as_ref().map(|n| n.id.clone());
+        let cover_url = app.now_playing.as_ref().and_then(|n| n.album_art_url.clone());
+        let hovered = cover_url.is_some() && app.image_preview == cover_url;
+        match (&app.cover_art, hovered, app.true_images, app.cover_art_png.clone(), now_key) {
+            (Some(img), true, true, Some(png), Some(key)) => {
+                // Pixel art underneath, real picture laid over it while hovered.
+                render_image(f, img, img_area, p.bg, false);
+                protos.push(ProtocolImage { slot: SIDEBAR_COVER_SLOT, key, rect: img_area, png });
+            }
+            (Some(img), true, _, _, _) => render_image_fine(f, img, img_area, p.bg, false),
+            (Some(img), false, _, _, _) => render_image(f, img, img_area, p.bg, false),
+            (None, _, _, _, _) => f.render_widget(
                 Paragraph::new("♪").alignment(Alignment::Center).style(Style::default().fg(p.dim)),
                 Rect { y: inner.y + inner.height / 2, height: 1, ..inner },
             ),
@@ -651,12 +696,11 @@ fn render_sidebar(
         Paragraph::new(format!(" {}", app.status_message)).style(status_style),
         sidebar[5],
     );
-    protocol_rect
 }
 
 // ── Main column ───────────────────────────────────────────────────────────────
 
-fn render_main(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits) {
+fn render_main(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits, protos: &mut Vec<ProtocolImage>) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
@@ -689,7 +733,7 @@ fn render_main(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palett
     if app.viewing_settings {
         render_settings(f, app, content, p, main_active, hits);
     } else if app.viewing_artist {
-        render_artist(f, app, content, p, main_active, hits);
+        render_artist(f, app, content, p, main_active, hits, protos);
     } else if let Some(view) = app.library_view {
         render_library(f, app, view, content, p, main_active, hits);
     } else if app.showing_search_results {
@@ -1037,7 +1081,7 @@ fn render_library(f: &mut ratatui::Frame<'_>, app: &mut App, view: LibraryView, 
     }
 }
 
-fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, active: bool, hits: &mut Hits) {
+fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, active: bool, hits: &mut Hits, protos: &mut Vec<ProtocolImage>) {
     let Some(page) = app.artist_page.clone() else { return };
     let (header, body) = split_header_body(area, 14);
 
@@ -1061,7 +1105,9 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
     }
     let photo_full = page.picture_url.as_deref().map(full_size_url);
     match page.picture_url.as_ref().and_then(|u| app.images.get(u)) {
-        Some(img) if img.width() > 1 => render_artwork(f, app, img, photo_full.as_deref(), photo_area, p.bg, true),
+        Some(img) if img.width() > 1 => {
+            render_artwork(f, app, img, photo_full.as_deref(), photo_area, p.bg, true, ARTIST_PHOTO_SLOT, protos)
+        }
         _ => f.render_widget(
             Paragraph::new(vec![Line::from(""), Line::from(""), Line::from(""), Line::from(""), Line::from(""), Line::from("◯")])
                 .alignment(Alignment::Center)
@@ -1195,7 +1241,7 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
 
 // ── Right column: detail card + shortcuts ─────────────────────────────────────
 
-fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits) {
+fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, hits: &mut Hits, protos: &mut Vec<ProtocolImage>) {
     let (label, img, title, subtitle, preview_url): (&str, Option<&DynamicImage>, String, String, Option<String>) =
         match app.selected_detail() {
             Some((url, title, subtitle)) => (
@@ -1232,7 +1278,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
             hit(hits, img_area, Hit::Image(url.clone()));
         }
         match img {
-            Some(img) => render_artwork(f, app, img, preview_url.as_deref(), img_area, p.bg, false),
+            Some(img) => render_artwork(f, app, img, preview_url.as_deref(), img_area, p.bg, false, DETAIL_SLOT, protos),
             None => f.render_widget(
                 Paragraph::new(vec![Line::from(""), Line::from(""), Line::from(""), Line::from(""), Line::from("♪")])
                     .alignment(Alignment::Center)
@@ -1312,7 +1358,7 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" MOUSE", muted(p).add_modifier(Modifier::BOLD))));
-    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("R-click", "Track menu"), ("Artwork", "Hover: sharpen"), ("Titles", "Resize lists"), ("Wheel", "Scroll / volume")] {
+    for (k, d) in [("Hover", "Focus follows"), ("Click", "Select / open"), ("2×Click", "Play track"), ("Title", "Open album"), ("Artist", "Open artist"), ("R-click", "Track menu"), ("Artwork", "Hover: real image"), ("Titles", "Resize lists"), ("Wheel", "Scroll / volume")] {
         lines.push(Line::from(vec![key_span(k, p), Span::styled(d.to_string(), Style::default().fg(p.fg))]));
     }
     lines.push(Line::from(""));

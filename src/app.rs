@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use ratatui::widgets::ListState;
@@ -319,7 +320,7 @@ pub struct App {
     pub auto_transition_armed: bool,
     /// Decoded cover-art image for the current track (None until downloaded).
     pub cover_art: Option<image::DynamicImage>,
-    pub cover_art_png: Option<Vec<u8>>,
+    pub cover_art_png: Option<Arc<Vec<u8>>>,
     pub cover_art_track_id: Option<String>,
     /// Snapshot from the previous session, consumed once resume has run.
     pub saved_state: Option<PlaybackState>,
@@ -336,6 +337,10 @@ pub struct App {
     /// Decoded thumbnails keyed by URL, shared by the artist page and the detail card.
     pub images: HashMap<String, image::DynamicImage>,
     pub pending_images: HashSet<String>,
+    /// PNG encodings of full-size artworks, for terminals with a graphics protocol.
+    pub images_png: HashMap<String, Arc<Vec<u8>>>,
+    /// True when the terminal draws real images (kitty protocol / ueberzugpp).
+    pub true_images: bool,
     /// Album currently listed in the main panel (id, title, artist), if any.
     pub current_album: Option<(String, String, String)>,
     /// Clickable regions of the last rendered frame.
@@ -424,6 +429,8 @@ impl App {
             library_artists: vec![],
             images: HashMap::new(),
             pending_images: HashSet::new(),
+            images_png: HashMap::new(),
+            true_images: false,
             current_album: None,
             clicks: Vec::new(),
             loading: None,
@@ -871,6 +878,12 @@ impl App {
         }
         if let Some(url) = &self.image_preview {
             urls.push(url.clone());
+        }
+        if self.true_images {
+            // Real images deserve the full-size files.
+            for url in urls.clone() {
+                urls.push(full_size_url(&url));
+            }
         }
         urls
     }

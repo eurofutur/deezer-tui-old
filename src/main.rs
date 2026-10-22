@@ -176,7 +176,12 @@ fn detect_image_protocol() -> ImageProtocol {
 struct UeberzugppLayer {
     child: Child,
     stdin: ChildStdin,
-    identifier: String,
+}
+
+const IMAGE_SLOTS: usize = 3;
+
+fn slot_identifier(slot: usize) -> String {
+    format!("deezer-tui-{slot}")
 }
 
 impl UeberzugppLayer {
@@ -190,20 +195,16 @@ impl UeberzugppLayer {
             .spawn()
             .ok()?;
         let stdin = child.stdin.take()?;
-        Some(Self {
-            child,
-            stdin,
-            identifier: "deezer-tui-cover".to_string(),
-        })
+        Some(Self { child, stdin })
     }
 
-    fn add(&mut self, path: &Path, area: ratatui::layout::Rect) -> io::Result<()> {
+    fn add(&mut self, slot: usize, path: &Path, area: ratatui::layout::Rect) -> io::Result<()> {
         if area.width == 0 || area.height == 0 {
             return Ok(());
         }
         let payload = json!({
             "action": "add",
-            "identifier": self.identifier,
+            "identifier": slot_identifier(slot),
             "path": path.display().to_string(),
             "x": area.x,
             "y": area.y,
@@ -215,25 +216,27 @@ impl UeberzugppLayer {
         self.stdin.flush()
     }
 
-    fn remove(&mut self) -> io::Result<()> {
+    fn remove(&mut self, slot: usize) -> io::Result<()> {
         let payload = json!({
             "action": "remove",
-            "identifier": self.identifier
+            "identifier": slot_identifier(slot)
         });
         writeln!(self.stdin, "{}", payload)?;
         self.stdin.flush()
     }
 
     fn shutdown(mut self) {
-        let _ = self.remove();
+        for slot in 0..IMAGE_SLOTS {
+            let _ = self.remove(slot);
+        }
         let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn write_cover_png_temp(png: &[u8]) -> io::Result<PathBuf> {
-    let path = std::env::temp_dir().join("deezer-tui-cover.png");
+fn write_cover_png_temp(png: &[u8], slot: usize) -> io::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("deezer-tui-image-{slot}.png"));
     fs::write(&path, png)?;
     Ok(path)
 }
@@ -498,8 +501,14 @@ async fn run_tui_loop(
         image_protocol = ImageProtocol::None;
     }
     let use_true_image_protocol = image_protocol != ImageProtocol::None;
+    app.status_message = match image_protocol {
+        ImageProtocol::Kitty => "Images: kitty graphics protocol".into(),
+        ImageProtocol::Ueberzugpp => "Images: ueberzugpp".into(),
+        ImageProtocol::None => "Images: text blocks (terminal without graphics)".into(),
+    };
     let kitty_image_id: u32 = 1337;
-    let mut last_drawn_cover_sig: Option<(String, u16, u16, u16, u16)> = None;
+    // Per slot: what is currently drawn (key + rect), to redraw only on change.
+    let mut drawn_images: [Option<(String, u16, u16, u16, u16)>; IMAGE_SLOTS] = Default::default();
     let mut force_full_redraw = true;
     // Channel for background cover-art downloads.
     let (cover_tx, mut cover_rx) =
@@ -735,7 +744,7 @@ async fn run_tui_loop(
                     let mut png = Vec::new();
                     let mut cursor = io::Cursor::new(&mut png);
                     if img.write_to(&mut cursor, image::ImageFormat::Png).is_ok() {
-                        app.cover_art_png = Some(png);
+                        app.cover_art_png = Some(Arc::new(png));
                     } else {
                         app.cover_art_png = None;
                     }
@@ -782,47 +791,71 @@ async fn run_tui_loop(
             terminal.clear()?;
             force_full_redraw = false;
         }
-        let mut protocol_art_rect = None;
+        // Graphics protocol: encode the full-size artworks the screen wants.
+        if use_true_image_protocol {
+            for url in app.wanted_images() {
+                if app.images_png.contains_key(&url) {
+                    continue;
+                }
+                if let Some(img) = app.images.get(&url).filter(|i| i.width() > 1) {
+                    let mut png = Vec::new();
+                    let mut cursor = io::Cursor::new(&mut png);
+                    if img.write_to(&mut cursor, image::ImageFormat::Png).is_ok() {
+                        app.images_png.insert(url, Arc::new(png));
+                    }
+                }
+            }
+        }
+
+        let mut protocol_images = Vec::new();
         terminal.draw(|f| {
-            protocol_art_rect = ui::render(f, app, use_true_image_protocol);
+            protocol_images = ui::render(f, app, use_true_image_protocol);
         })?;
 
         if use_true_image_protocol {
-            if let (Some(rect), Some(track_id), Some(png)) = (
-                protocol_art_rect,
-                app.cover_art_track_id.as_ref(),
-                app.cover_art_png.as_ref(),
-            ) {
-                let sig = (track_id.clone(), rect.x, rect.y, rect.width, rect.height);
-                if last_drawn_cover_sig.as_ref() != Some(&sig) {
-                    match image_protocol {
-                        ImageProtocol::Kitty => {
-                            let _ = kitty_draw_png_at_rect(png, kitty_image_id, rect);
-                        }
-                        ImageProtocol::Ueberzugpp => {
-                            if let (Some(layer), Ok(path)) =
-                                (ueberzugpp_layer.as_mut(), write_cover_png_temp(png))
-                            {
-                                let _ = layer.add(&path, rect);
-                            }
-                        }
-                        ImageProtocol::None => {}
-                    }
-                    last_drawn_cover_sig = Some(sig);
+            let mut seen = [false; IMAGE_SLOTS];
+            for img in &protocol_images {
+                if img.slot >= IMAGE_SLOTS {
+                    continue;
                 }
-            } else if last_drawn_cover_sig.is_some() {
+                seen[img.slot] = true;
+                // Artworks are square: keep the ratio and centre them in the box.
+                let rect = square_in_cells(img.rect);
+                let sig = (img.key.clone(), rect.x, rect.y, rect.width, rect.height);
+                if drawn_images[img.slot].as_ref() == Some(&sig) {
+                    continue;
+                }
                 match image_protocol {
                     ImageProtocol::Kitty => {
-                        let _ = kitty_delete_image(kitty_image_id);
+                        let _ = kitty_draw_png_at_rect(&img.png, kitty_image_id + img.slot as u32, rect);
                     }
                     ImageProtocol::Ueberzugpp => {
-                        if let Some(layer) = ueberzugpp_layer.as_mut() {
-                            let _ = layer.remove();
+                        if let (Some(layer), Ok(path)) =
+                            (ueberzugpp_layer.as_mut(), write_cover_png_temp(&img.png, img.slot))
+                        {
+                            let _ = layer.add(img.slot, &path, rect);
                         }
                     }
                     ImageProtocol::None => {}
                 }
-                last_drawn_cover_sig = None;
+                drawn_images[img.slot] = Some(sig);
+            }
+            for slot in 0..IMAGE_SLOTS {
+                if seen[slot] || drawn_images[slot].is_none() {
+                    continue;
+                }
+                match image_protocol {
+                    ImageProtocol::Kitty => {
+                        let _ = kitty_delete_image(kitty_image_id + slot as u32);
+                    }
+                    ImageProtocol::Ueberzugpp => {
+                        if let Some(layer) = ueberzugpp_layer.as_mut() {
+                            let _ = layer.remove(slot);
+                        }
+                    }
+                    ImageProtocol::None => {}
+                }
+                drawn_images[slot] = None;
             }
         }
 
@@ -850,6 +883,8 @@ async fn run_tui_loop(
                     // new terminal (dtach), that terminal never saw them.
                     let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
                     force_full_redraw = true;
+                    // A re-attached terminal never saw the images: send them again.
+                    drawn_images = Default::default();
                 }
                 _ => {}
             }
@@ -1907,7 +1942,9 @@ async fn run_tui_loop(
     if use_true_image_protocol {
         match image_protocol {
             ImageProtocol::Kitty => {
-                let _ = kitty_delete_image(kitty_image_id);
+                for slot in 0..IMAGE_SLOTS {
+                    let _ = kitty_delete_image(kitty_image_id + slot as u32);
+                }
             }
             ImageProtocol::Ueberzugpp => {
                 if let Some(layer) = ueberzugpp_layer.take() {
@@ -1931,6 +1968,26 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> An
         .context("failed to leave alternate screen")?;
     terminal.show_cursor().context("failed to restore cursor")?;
     Ok(())
+}
+
+/// Largest square (in pixels) that fits `area`, centred, expressed in cells.
+/// Uses the terminal's reported pixel size; falls back to 1:2 cells.
+fn square_in_cells(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let (cell_w, cell_h) = match crossterm::terminal::window_size() {
+        Ok(ws) if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 => {
+            (ws.width as f64 / ws.columns as f64, ws.height as f64 / ws.rows as f64)
+        }
+        _ => (1.0, 2.0),
+    };
+    let side_px = (area.width as f64 * cell_w).min(area.height as f64 * cell_h);
+    let cols = ((side_px / cell_w).floor() as u16).clamp(1, area.width);
+    let rows = ((side_px / cell_h).floor() as u16).clamp(1, area.height);
+    ratatui::layout::Rect {
+        x: area.x + (area.width - cols) / 2,
+        y: area.y + (area.height - rows) / 2,
+        width: cols,
+        height: rows,
+    }
 }
 
 /// Restart the current track at `seek_ms`, keeping it paused if it was paused.
