@@ -222,6 +222,26 @@ fn render_image_fine(f: &mut ratatui::Frame<'_>, img: &DynamicImage, area: Rect,
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Largest square (in pixels) that fits `area`, centred, expressed in cells.
+/// Uses the terminal's reported pixel size; falls back to 1:2 cells.
+fn square_in_cells(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let (cell_w, cell_h) = match crossterm::terminal::window_size() {
+        Ok(ws) if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 => {
+            (ws.width as f64 / ws.columns as f64, ws.height as f64 / ws.rows as f64)
+        }
+        _ => (1.0, 2.0),
+    };
+    let side_px = (area.width as f64 * cell_w).min(area.height as f64 * cell_h);
+    let cols = ((side_px / cell_w).floor() as u16).clamp(1, area.width);
+    let rows = ((side_px / cell_h).floor() as u16).clamp(1, area.height);
+    ratatui::layout::Rect {
+        x: area.x + (area.width - cols) / 2,
+        y: area.y + (area.height - rows) / 2,
+        width: cols,
+        height: rows,
+    }
+}
+
 /// Draw an artwork: sharpened (quadrant blocks from the full-size image) while
 /// the pointer hovers it, half-blocks otherwise.
 fn render_artwork(
@@ -236,6 +256,8 @@ fn render_artwork(
     protos: &mut Vec<ProtocolImage>,
 ) {
     let hovered = full_url.is_some() && app.image_preview.as_deref() == full_url;
+    // Same square for the pixel art and the real picture, so they line up.
+    let area = square_in_cells(area);
     // Pixel look by default; while hovered, the real picture is laid over the
     // cells by the terminal's graphics protocol (or sharpened as text without one).
     if hovered && app.true_images {
@@ -532,9 +554,8 @@ fn render_sidebar(
         let block = panel(None, false, p);
         let inner = block.inner(sidebar[4]);
         f.render_widget(block, sidebar[4]);
-        // Keep the image square: centre a (2h × h) area inside the block.
-        let w = (inner.height * 2).min(inner.width);
-        let img_area = Rect { x: inner.x + (inner.width - w) / 2, y: inner.y, width: w, height: inner.height };
+        // Keep the image square (real cell size), same rect as the hover picture.
+        let img_area = square_in_cells(inner);
         let now_key = app.now_playing.as_ref().map(|n| n.id.clone());
         let cover_url = app.now_playing.as_ref().and_then(|n| n.album_art_url.clone());
         let hovered = cover_url.is_some() && app.image_preview == cover_url;
@@ -1257,7 +1278,9 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
             },
         };
 
-    let card_height = if label.is_empty() { 0 } else { 16 };
+    // Fit the card to its content: square cover, one blank row, title, artist.
+    let cover = square_in_cells(Rect { x: 0, y: 0, width: 20u16.min(area.width.saturating_sub(2)), height: 10 });
+    let card_height = if label.is_empty() { 0 } else { cover.height + 5 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(card_height), Constraint::Min(0)])
@@ -1267,12 +1290,11 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
         let block = panel(Some(label), false, p);
         let inner = block.inner(rows[0]);
         f.render_widget(block, rows[0]);
-        let img_w = 20u16.min(inner.width);
         let img_area = Rect {
-            x: inner.x + (inner.width.saturating_sub(img_w)) / 2,
+            x: inner.x + (inner.width.saturating_sub(cover.width)) / 2,
             y: inner.y,
-            width: img_w,
-            height: 10.min(inner.height),
+            width: cover.width,
+            height: cover.height.min(inner.height),
         };
         if let (Some(url), Some(_)) = (preview_url.as_ref(), img) {
             hit(hits, img_area, Hit::Image(url.clone()));

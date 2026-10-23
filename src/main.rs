@@ -819,8 +819,8 @@ async fn run_tui_loop(
                     continue;
                 }
                 seen[img.slot] = true;
-                // Artworks are square: keep the ratio and centre them in the box.
-                let rect = square_in_cells(img.rect);
+                // ui already fitted artworks to a centred square in cells.
+                let rect = img.rect;
                 let sig = (img.key.clone(), rect.x, rect.y, rect.width, rect.height);
                 if drawn_images[img.slot].as_ref() == Some(&sig) {
                     continue;
@@ -1034,7 +1034,7 @@ async fn run_tui_loop(
                                 }
                             }
                         }
-                        KeyCode::Char('p') if !app.is_searching => {
+                        KeyCode::Char('p') | KeyCode::Char(' ') if !app.is_searching => {
                             if app.now_playing.is_none() {
                                 app.command_sender
                                     .send(Command::PlayTrack("3135556".to_string()))
@@ -1968,26 +1968,6 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> An
         .context("failed to leave alternate screen")?;
     terminal.show_cursor().context("failed to restore cursor")?;
     Ok(())
-}
-
-/// Largest square (in pixels) that fits `area`, centred, expressed in cells.
-/// Uses the terminal's reported pixel size; falls back to 1:2 cells.
-fn square_in_cells(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let (cell_w, cell_h) = match crossterm::terminal::window_size() {
-        Ok(ws) if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 => {
-            (ws.width as f64 / ws.columns as f64, ws.height as f64 / ws.rows as f64)
-        }
-        _ => (1.0, 2.0),
-    };
-    let side_px = (area.width as f64 * cell_w).min(area.height as f64 * cell_h);
-    let cols = ((side_px / cell_w).floor() as u16).clamp(1, area.width);
-    let rows = ((side_px / cell_h).floor() as u16).clamp(1, area.height);
-    ratatui::layout::Rect {
-        x: area.x + (area.width - cols) / 2,
-        y: area.y + (area.height - rows) / 2,
-        width: cols,
-        height: rows,
-    }
 }
 
 /// Restart the current track at `seek_ms`, keeping it paused if it was paused.

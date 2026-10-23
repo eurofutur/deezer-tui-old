@@ -10,7 +10,7 @@
 
     Enter - Select
 
-    P - Play/Pause
+    P / Space - Play/Pause
 
     / - Search
 
