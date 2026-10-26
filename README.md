@@ -66,7 +66,7 @@ If you aren't on Arch or Debian, you can just grab the pre-compiled binary from 
 Since I originally made this just to fit my own needs, I don't plan on actively maintaining or expanding it. If you stumble across this and want to pick up the project, clean up the code, or add new features please do!
 ## Updates & releases
 
-The app checks the latest [GitHub release](https://github.com/Eurofutur/deezer-tui/releases) at startup and shows
+The app checks the latest [GitHub release](https://github.com/eurofutur/deezer-tui/releases) at startup and shows
 `Update vX.Y.Z available` in the status bar. Install it from **Settings › Install update** (or check manually from
 the same row): the binary replaces the running executable, restart to use it.
 

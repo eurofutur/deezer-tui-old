@@ -5,7 +5,7 @@
 set -euo pipefail
 
 version=${1:?usage: release.sh <version, e.g. 0.2.0>}
-repo=Eurofutur/deezer-tui # must match update::API
+repo=eurofutur/deezer-tui # must match update::API
 asset=deezer-tui-x86_64-linux # must match update::ASSET
 tag=v$version
 

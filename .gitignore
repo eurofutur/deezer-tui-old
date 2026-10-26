@@ -1,4 +1,5 @@
 # gitignore
 # ignore the target directory
 target/
-target/debug/.trail/cache/
+target/debug/
+.trail/cache/

@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-const API: &str = "https://api.github.com/repos/Eurofutur/deezer-tui";
+const API: &str = "https://api.github.com/repos/eurofutur/deezer-tui";
 /// Binary asset uploaded by `release.sh`.
 pub const ASSET: &str = "deezer-tui-x86_64-linux";
 
