@@ -64,3 +64,11 @@ If you aren't on Arch or Debian, you can just grab the pre-compiled binary from 
 ## Pick Up This Project
 
 Since I originally made this just to fit my own needs, I don't plan on actively maintaining or expanding it. If you stumble across this and want to pick up the project, clean up the code, or add new features please do!
+## Updates & releases
+
+The app checks the latest [Codeberg release](https://codeberg.org/pyratt/deezer-tui/releases) at startup and shows
+`Update vX.Y.Z available` in the status bar. Install it from **Settings › Install update** (or check manually from
+the same row): the binary replaces the running executable, restart to use it. While the repo is private, set
+`"codeberg_token"` in `~/.deezer-tui-config.json` (or `CODEBERG_TOKEN`) to a token with `read:repository`.
+
+Publish a release: `CODEBERG_TOKEN=<write:repository token> ./release.sh 0.2.0`

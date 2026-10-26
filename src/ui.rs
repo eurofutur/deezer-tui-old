@@ -833,6 +833,10 @@ fn render_settings(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pa
         format!("Discord Rich Presence: {}", on_off(app.discord_rpc_enabled)),
         format!("Resume on start: {}", on_off(app.config.resume_on_start)),
         "Set ARL from the search box".to_string(),
+        match &app.update {
+            Some(r) => format!("Install update {} (v{} now)", r.tag_name, env!("CARGO_PKG_VERSION")),
+            None => format!("Check for updates (v{})", env!("CARGO_PKG_VERSION")),
+        },
     ];
     let heights = vec![1u16; items.len()];
     let block = panel(None, false, p);

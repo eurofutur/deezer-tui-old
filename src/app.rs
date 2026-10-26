@@ -87,6 +87,8 @@ pub enum UiEvent {
     AlbumLoaded(AlbumPage),
     FavoriteAlbumsLoaded(Vec<LibraryAlbum>),
     FavoriteArtistsLoaded(Vec<ArtistRef>),
+    /// Result of an update check: Some(release) when a newer one exists.
+    UpdateChecked(Option<crate::update::Release>),
 }
 
 /// Tabs of the artist page, in Deezer's order.
@@ -323,6 +325,8 @@ pub struct App {
     /// Seed track (id, title) of the last mix, for the track list header.
     pub mix_seed: Option<(String, String)>,
     pub status_message: String,
+    /// Newer Codeberg release found by the update check.
+    pub update: Option<crate::update::Release>,
     pub is_searching: bool,
     pub search_query: String,
     pub auto_transition_armed: bool,
@@ -426,6 +430,7 @@ impl App {
             current_playlist_id: None,
             mix_seed: None,
             status_message: "Status: Waiting...".into(),
+            update: None,
             is_searching: false,
             search_query: String::new(),
             auto_transition_armed: false,
@@ -535,7 +540,7 @@ impl App {
                     return;
                 }
                 if self.viewing_settings {
-                    let max = 5usize;
+                    let max = 6usize;
                     let current = self.settings_state.selected().unwrap_or(0);
                     self.settings_state.select(Some((current + 1).min(max)));
                 } else if self.showing_search_results {

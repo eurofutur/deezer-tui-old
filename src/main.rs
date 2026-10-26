@@ -8,6 +8,7 @@ mod player;
 mod state;
 mod theme;
 mod ui;
+mod update;
 
 use std::{
     fs,
@@ -481,6 +482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let update_tx = event_tx.clone();
+    spawn_update_check(&app.config.codeberg_token, update_tx.clone(), false);
     let mut audio_task = Some(tokio::spawn(audio_worker_loop(command_rx, event_tx)));
     // Sync worker's current_quality with the loaded config
     let _ = app.command_sender.send(Command::SetQuality(initial_quality));
@@ -493,6 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut terminal,
         &mut app,
         &mut event_rx,
+        update_tx,
         &mut audio_task,
         &mut mpris_handle,
         &discord_rpc,
@@ -531,6 +535,7 @@ async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    update_tx: mpsc::UnboundedSender<UiEvent>,
     audio_task: &mut Option<tokio::task::JoinHandle<()>>,
     mpris: &mut Option<MprisHandle>,
     discord_rpc: &DiscordRpcHandle,
@@ -1370,6 +1375,24 @@ async fn run_tui_loop(
                                                         app.search_query.clear();
                                                     }
                                                 }
+                                                6 => match app.update.clone() {
+                                                    Some(release) => {
+                                                        app.status_message = format!("Downloading {}...", release.tag_name);
+                                                        let token = app.config.codeberg_token.clone();
+                                                        let tx = update_tx.clone();
+                                                        tokio::spawn(async move {
+                                                            let msg = match update::install(&token, &release).await {
+                                                                Ok(()) => format!("Status: Updated to {} - restart deezer-tui", release.tag_name),
+                                                                Err(err) => format!("Status: Update failed: {err:#}"),
+                                                            };
+                                                            let _ = tx.send(UiEvent::Error(msg));
+                                                        });
+                                                    }
+                                                    None => {
+                                                        app.status_message = "Checking for updates...".into();
+                                                        spawn_update_check(&app.config.codeberg_token, update_tx.clone(), true);
+                                                    }
+                                                },
                                                 _ => {}
                                             }
                                         }
@@ -1650,6 +1673,13 @@ async fn run_tui_loop(
 
         while let Ok(event) = event_rx.try_recv() {
             match event {
+                UiEvent::UpdateChecked(release) => {
+                    app.status_message = match &release {
+                        Some(r) => format!("Update {} available - Settings > Install update", r.tag_name),
+                        None => format!("deezer-tui v{} is up to date", env!("CARGO_PKG_VERSION")),
+                    };
+                    app.update = release;
+                }
                 UiEvent::HistoryLoaded(history) => {
                     apply_resume(app, &history);
                 }
@@ -3241,6 +3271,22 @@ fn config_file_path() -> AnyResult<PathBuf> {
     dirs::home_dir()
         .map(|path| path.join(".deezer-tui-config.json"))
         .ok_or_else(|| anyhow!("could not resolve the user's home directory"))
+}
+
+/// `verbose`: report "up to date" and errors (manual check); startup only reports a new release.
+fn spawn_update_check(token: &str, tx: mpsc::UnboundedSender<UiEvent>, verbose: bool) {
+    let token = token.to_owned();
+    tokio::spawn(async move {
+        match update::check(&token).await {
+            Ok(release) if verbose || release.is_some() => {
+                let _ = tx.send(UiEvent::UpdateChecked(release));
+            }
+            Err(err) if verbose => {
+                let _ = tx.send(UiEvent::Error(format!("Status: Update check failed: {err:#}")));
+            }
+            _ => {}
+        }
+    });
 }
 
 fn load_config() -> Config {
