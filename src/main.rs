@@ -1027,22 +1027,32 @@ async fn run_tui_loop(
                             let _ = save_config(&app.config);
                             app.status_message = format!("Theme: {}", app.config.theme.label());
                         }
-                        KeyCode::Char('a') if !app.is_searching => {
-                            match app.now_playing.as_ref().map(|n| n.id.clone()) {
-                                Some(track_id) => {
+                        // a / e: artist / album of the focused track — the one playing when
+                        // the player has focus, otherwise the one selected in the focused list.
+                        KeyCode::Char(c @ ('a' | 'e')) if !app.is_searching => {
+                            let player_focused = matches!(
+                                app.active_panel,
+                                ActivePanel::Player | ActivePanel::PlayerProgress | ActivePanel::PlayerInfo
+                            );
+                            let track_id = if player_focused {
+                                app.now_playing.as_ref().map(|n| n.id.clone())
+                            } else {
+                                match app.active_panel {
+                                    ActivePanel::Queue | ActivePanel::Main => app.selected_track().map(|t| t.0),
+                                    _ => None,
+                                }
+                            };
+                            match track_id {
+                                Some(track_id) if c == 'a' => {
                                     app.status_message = "Opening artist...".into();
                                     let _ = app.command_sender.send(Command::OpenArtistOfTrack(track_id));
                                 }
-                                None => app.status_message = "Nothing is playing".into(),
-                            }
-                        }
-                        KeyCode::Char('e') if !app.is_searching => {
-                            match app.now_playing.as_ref().map(|n| n.id.clone()) {
                                 Some(track_id) => {
                                     app.status_message = "Opening album...".into();
                                     let _ = app.command_sender.send(Command::OpenAlbumOfTrack(track_id));
                                 }
-                                None => app.status_message = "Nothing is playing".into(),
+                                None if player_focused => app.status_message = "Nothing is playing".into(),
+                                None => app.status_message = "Select a track first".into(),
                             }
                         }
                         // Esc / PageUp: previous page; PageDown: next page (browser-style history).
