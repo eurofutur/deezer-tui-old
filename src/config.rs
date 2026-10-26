@@ -72,9 +72,6 @@ pub struct Config {
     /// Index into `SIDEBAR_SPLITS`: playlists / queue height ratio.
     #[serde(default = "default_split")]
     pub sidebar_split: usize,
-    /// Codeberg access token for self-update while the repo is private.
-    #[serde(default)]
-    pub codeberg_token: String,
 }
 
 /// Playlists / queue percentages cycled by clicking a panel title.
@@ -99,7 +96,6 @@ impl Default for Config {
             arl: String::new(),
             resume_on_start: true,
             sidebar_split: 2,
-            codeberg_token: String::new(),
         }
     }
 }

@@ -483,7 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let update_tx = event_tx.clone();
-    spawn_update_check(&app.config.codeberg_token, update_tx.clone(), false);
+    spawn_update_check(update_tx.clone(), false);
     let mut audio_task = Some(tokio::spawn(audio_worker_loop(command_rx, event_tx)));
     // Sync worker's current_quality with the loaded config
     let _ = app.command_sender.send(Command::SetQuality(initial_quality));
@@ -1378,10 +1378,9 @@ async fn run_tui_loop(
                                                 6 => match app.update.clone() {
                                                     Some(release) => {
                                                         app.status_message = format!("Downloading {}...", release.tag_name);
-                                                        let token = app.config.codeberg_token.clone();
                                                         let tx = update_tx.clone();
                                                         tokio::spawn(async move {
-                                                            let msg = match update::install(&token, &release).await {
+                                                            let msg = match update::install(&release).await {
                                                                 Ok(()) => format!("Status: Updated to {} - restart deezer-tui", release.tag_name),
                                                                 Err(err) => format!("Status: Update failed: {err:#}"),
                                                             };
@@ -1390,7 +1389,7 @@ async fn run_tui_loop(
                                                     }
                                                     None => {
                                                         app.status_message = "Checking for updates...".into();
-                                                        spawn_update_check(&app.config.codeberg_token, update_tx.clone(), true);
+                                                        spawn_update_check(update_tx.clone(), true);
                                                     }
                                                 },
                                                 _ => {}
@@ -3274,10 +3273,9 @@ fn config_file_path() -> AnyResult<PathBuf> {
 }
 
 /// `verbose`: report "up to date" and errors (manual check); startup only reports a new release.
-fn spawn_update_check(token: &str, tx: mpsc::UnboundedSender<UiEvent>, verbose: bool) {
-    let token = token.to_owned();
+fn spawn_update_check(tx: mpsc::UnboundedSender<UiEvent>, verbose: bool) {
     tokio::spawn(async move {
-        match update::check(&token).await {
+        match update::check().await {
             Ok(release) if verbose || release.is_some() => {
                 let _ = tx.send(UiEvent::UpdateChecked(release));
             }

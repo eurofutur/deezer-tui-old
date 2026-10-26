@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Usage: CODEBERG_TOKEN=... ./release.sh 0.2.0
-# Bumps Cargo.toml, builds, tags v<version>, pushes, and publishes a Codeberg
-# release with the binary that the app's updater downloads.
+# Usage: ./release.sh 0.2.0   (needs `gh auth login`)
+# Bumps Cargo.toml, builds, tags v<version>, pushes to Codeberg and GitHub, and
+# publishes a GitHub release with the binary that the app's updater downloads.
 set -euo pipefail
 
 version=${1:?usage: release.sh <version, e.g. 0.2.0>}
-: "${CODEBERG_TOKEN:?export CODEBERG_TOKEN (Codeberg > Settings > Applications, scope write:repository)}"
-api=https://codeberg.org/api/v1/repos/pyratt/deezer-tui
+repo=Eurofutur/deezer-tui # must match update::API
 asset=deezer-tui-x86_64-linux # must match update::ASSET
 tag=v$version
 
@@ -19,11 +18,9 @@ cargo build --release
 git commit -qam "Release $tag"
 git tag -a "$tag" -m "$tag"
 git push -q origin HEAD "$tag"
+git push -q github HEAD "$tag"
 
 notes=$(git log --format='- %s' "$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || git rev-list --max-parents=0 HEAD)..$tag^")
-auth=(-H "Authorization: token $CODEBERG_TOKEN")
-id=$(jq -n --arg t "$tag" --arg b "$notes" '{tag_name:$t,name:$t,body:$b}' |
-  curl -fsS "${auth[@]}" -H 'Content-Type: application/json' -d @- "$api/releases" | jq -r .id)
-curl -fsS "${auth[@]}" -F "attachment=@target/release/deezer-tui;filename=$asset" \
-  "$api/releases/$id/assets?name=$asset" >/dev/null
-echo "Published $tag (release $id)"
+cp target/release/deezer-tui "target/release/$asset"
+gh release create "$tag" "target/release/$asset" -R "$repo" -t "$tag" -n "$notes"
+echo "Published $tag"

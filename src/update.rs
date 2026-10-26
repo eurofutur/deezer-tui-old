@@ -1,9 +1,9 @@
-//! Self-update from the latest Codeberg release (Obtainium-style).
+//! Self-update from the latest GitHub release (Obtainium-style).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-const API: &str = "https://codeberg.org/api/v1/repos/pyratt/deezer-tui";
+const API: &str = "https://api.github.com/repos/Eurofutur/deezer-tui";
 /// Binary asset uploaded by `release.sh`.
 pub const ASSET: &str = "deezer-tui-x86_64-linux";
 
@@ -19,22 +19,11 @@ struct Asset {
     browser_download_url: String,
 }
 
-/// The repo is private: a Codeberg token (read:repository) is needed until it goes public.
-fn token(config_token: &str) -> Option<String> {
-    std::env::var("CODEBERG_TOKEN")
-        .ok()
-        .or_else(|| Some(config_token.to_string()))
-        .filter(|t| !t.trim().is_empty())
-}
-
-fn get(url: &str, token: &Option<String>) -> reqwest::RequestBuilder {
-    let req = reqwest::Client::new()
+fn get(url: &str) -> reqwest::RequestBuilder {
+    // GitHub rejects API requests without a User-Agent.
+    reqwest::Client::new()
         .get(url)
-        .header("User-Agent", concat!("deezer-tui/", env!("CARGO_PKG_VERSION")));
-    match token {
-        Some(t) => req.header("Authorization", format!("token {}", t.trim())),
-        None => req,
-    }
+        .header("User-Agent", concat!("deezer-tui/", env!("CARGO_PKG_VERSION")))
 }
 
 fn parse_version(s: &str) -> Vec<u64> {
@@ -46,26 +35,24 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
 }
 
 /// Latest release if it is newer than the running build.
-pub async fn check(config_token: &str) -> Result<Option<Release>> {
-    let token = token(config_token);
-    let resp = get(&format!("{API}/releases/latest"), &token).send().await?;
-    match resp.status().as_u16() {
-        404 if token.is_none() => bail!("no access to releases (set codeberg_token in config)"),
-        404 => return Ok(None),
-        _ => {}
+pub async fn check() -> Result<Option<Release>> {
+    let resp = get(&format!("{API}/releases/latest")).send().await?;
+    // 404: no release published yet.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
     }
     let release: Release = resp.error_for_status()?.json().await?;
     Ok(is_newer(&release.tag_name, env!("CARGO_PKG_VERSION")).then_some(release))
 }
 
 /// Download the release binary and atomically replace the running executable.
-pub async fn install(config_token: &str, release: &Release) -> Result<()> {
+pub async fn install(release: &Release) -> Result<()> {
     let asset = release
         .assets
         .iter()
         .find(|a| a.name == ASSET)
         .ok_or_else(|| anyhow!("release {} has no {ASSET} asset", release.tag_name))?;
-    let bytes = get(&asset.browser_download_url, &token(config_token))
+    let bytes = get(&asset.browser_download_url)
         .send()
         .await?
         .error_for_status()?
