@@ -306,6 +306,56 @@ enum PlayerControl {
     SetVolume(f32),
 }
 
+/// Show a view taken from the back / forward history without pushing it again.
+fn restore_view(app: &mut App, view: ViewState) {
+    app.active_panel = ActivePanel::Main;
+    app.navigating_back = true;
+    match view {
+        ViewState::Library(view) => {
+            app.navigating_back = false;
+            app.show_library(view);
+        }
+        ViewState::Settings => {
+            app.navigating_back = false;
+            app.leave_special_views();
+            app.showing_search_results = false;
+            app.viewing_settings = true;
+        }
+        ViewState::Search => {
+            app.navigating_back = false;
+            app.leave_special_views();
+            app.viewing_settings = false;
+            app.showing_search_results = true;
+            app.main_state.select(Some(0));
+        }
+        ViewState::Artist(id) => {
+            let _ = app.command_sender.send(Command::LoadArtist(id));
+        }
+        ViewState::Album(id) => {
+            let _ = app.command_sender.send(Command::LoadAlbum(id));
+        }
+        ViewState::Tracks(source) => {
+            let cmd = match source.as_deref() {
+                Some("__home__") => Command::LoadHome,
+                Some("__explore__") => Command::LoadExplore,
+                Some(id) if !id.is_empty() => {
+                    app.current_playlist_id = Some(id.to_owned());
+                    Command::LoadPlaylist(id.to_owned())
+                }
+                _ => Command::LoadFavorites,
+            };
+            if matches!(cmd, Command::LoadHome | Command::LoadExplore | Command::LoadFavorites) {
+                app.current_playlist_id = match cmd {
+                    Command::LoadHome => Some("__home__".into()),
+                    Command::LoadExplore => Some("__explore__".into()),
+                    _ => None,
+                };
+            }
+            let _ = app.command_sender.send(cmd);
+        }
+    }
+}
+
 fn next_quality(current: AudioQuality, forward: bool) -> AudioQuality {
     match (current, forward) {
         (AudioQuality::Kbps128, true) => AudioQuality::Kbps320,
@@ -898,17 +948,28 @@ async fn run_tui_loop(
                         KeyCode::Enter | KeyCode::Right if menu_open => app.menu_activate(),
                         KeyCode::Left if menu_open => app.menu_back(),
                         _ if menu_open => {}
-                        // Track menu for the selected row (same as right-click).
-                        KeyCode::Char('m') if !in_search => {
+                        // m: start a mix from the selected track.
+                        KeyCode::Char('m') if !in_search => match app.selected_track() {
+                            Some(track) => app.start_mix(track),
+                            None => app.status_message = "Select a track first".into(),
+                        },
+                        // M: track menu for the selected row (same as right-click).
+                        KeyCode::Char('M') if !in_search => {
                             if let Some(track) = app.selected_track() {
+                                let in_queue = app.active_panel == ActivePanel::Queue;
+                                let queue_pos = if in_queue { app.queue_state.selected() } else { None };
                                 let selected = app.main_state.selected();
                                 let anchor = app
                                     .clicks
                                     .iter()
-                                    .find(|c| matches!(c.hit, Hit::MainRow { index, .. } if Some(index) == selected))
+                                    .find(|c| match c.hit {
+                                        Hit::QueueItem(i) => in_queue && Some(i) == queue_pos,
+                                        Hit::MainRow { index, .. } => !in_queue && Some(index) == selected,
+                                        _ => false,
+                                    })
                                     .map(|c| (c.rect.x + 6, c.rect.y + 1));
                                 let (x, y) = anchor.unwrap_or((40, 10));
-                                app.open_track_menu(track, x, y);
+                                app.open_track_menu(track, x, y, queue_pos);
                             } else {
                                 app.status_message = "Select a track first".into();
                             }
@@ -984,54 +1045,19 @@ async fn run_tui_loop(
                                 None => app.status_message = "Nothing is playing".into(),
                             }
                         }
-                        KeyCode::Esc if !app.is_searching && !app.history.is_empty() => {
+                        // Esc / PageUp: previous page; PageDown: next page (browser-style history).
+                        KeyCode::Esc | KeyCode::PageUp if !in_search && !app.history.is_empty() => {
                             if let Some(previous) = app.history.pop() {
-                                app.active_panel = ActivePanel::Main;
-                                app.navigating_back = true;
-                                match previous {
-                                    ViewState::Library(view) => {
-                                        app.navigating_back = false;
-                                        app.show_library(view);
-                                    }
-                                    ViewState::Settings => {
-                                        app.navigating_back = false;
-                                        app.leave_special_views();
-                                        app.showing_search_results = false;
-                                        app.viewing_settings = true;
-                                    }
-                                    ViewState::Search => {
-                                        app.navigating_back = false;
-                                        app.leave_special_views();
-                                        app.viewing_settings = false;
-                                        app.showing_search_results = true;
-                                        app.main_state.select(Some(0));
-                                    }
-                                    ViewState::Artist(id) => {
-                                        let _ = app.command_sender.send(Command::LoadArtist(id));
-                                    }
-                                    ViewState::Album(id) => {
-                                        let _ = app.command_sender.send(Command::LoadAlbum(id));
-                                    }
-                                    ViewState::Tracks(source) => {
-                                        let cmd = match source.as_deref() {
-                                            Some("__home__") => Command::LoadHome,
-                                            Some("__explore__") => Command::LoadExplore,
-                                            Some(id) if !id.is_empty() => {
-                                                app.current_playlist_id = Some(id.to_owned());
-                                                Command::LoadPlaylist(id.to_owned())
-                                            }
-                                            _ => Command::LoadFavorites,
-                                        };
-                                        if matches!(cmd, Command::LoadHome | Command::LoadExplore | Command::LoadFavorites) {
-                                            app.current_playlist_id = match cmd {
-                                                Command::LoadHome => Some("__home__".into()),
-                                                Command::LoadExplore => Some("__explore__".into()),
-                                                _ => None,
-                                            };
-                                        }
-                                        let _ = app.command_sender.send(cmd);
-                                    }
-                                }
+                                let current = app.current_view();
+                                app.forward.push(current);
+                                restore_view(app, previous);
+                            }
+                        }
+                        KeyCode::PageDown if !in_search && !app.forward.is_empty() => {
+                            if let Some(next) = app.forward.pop() {
+                                let current = app.current_view();
+                                app.history.push(current);
+                                restore_view(app, next);
                             }
                         }
                         KeyCode::Char('p') | KeyCode::Char(' ') if !app.is_searching => {
@@ -1895,22 +1921,10 @@ async fn run_tui_loop(
                         app.playlist_state.select(Some(0));
                     }
                 }
-                UiEvent::TracksLoaded(tracks) => {
-                    app.loading = None;
-                    app.remember_view(&ViewState::Tracks(app.current_playlist_id.clone()));
-                    app.current_tracks = tracks;
-                    app.showing_search_results = false;
-                    app.leave_special_views();
-                    app.search_playlists.clear();
-                    app.search_artists.clear();
-                    if app.current_tracks.is_empty() {
-                        app.status_message = "No tracks found for this playlist/search".into();
-                    } else {
-                        app.status_message = format!("Loaded {} tracks", app.current_tracks.len());
-                    }
-                    app.main_state.select(Some(0));
-                    app.viewing_settings = false;
-                    app.active_panel = ActivePanel::Main;
+                UiEvent::TracksLoaded(tracks) => app.show_tracks(tracks),
+                UiEvent::MixLoaded(tracks) => {
+                    app.show_tracks(tracks);
+                    app.play_current_tracks();
                 }
                 UiEvent::SearchResultsLoaded {
                     tracks,
@@ -2125,12 +2139,12 @@ fn handle_mouse(
                 .rev()
                 .filter(|c| inside(c.rect))
                 .find_map(|c| match c.hit {
-                    Hit::MainRow { index, .. } => app.track_at_main_row(index),
-                    Hit::QueueItem(i) => app.queue_tracks.get(i).cloned(),
+                    Hit::MainRow { index, .. } => app.track_at_main_row(index).map(|t| (t, None)),
+                    Hit::QueueItem(i) => app.queue_tracks.get(i).cloned().map(|t| (t, Some(i))),
                     _ => None,
                 });
             match track {
-                Some(track) => app.open_track_menu(track, m.column, m.row),
+                Some((track, queue_pos)) => app.open_track_menu(track, m.column, m.row, queue_pos),
                 None => app.context_menu = None,
             }
         }
@@ -2578,7 +2592,10 @@ async fn audio_worker_loop(
                         let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
                     }
                     None => api.run("Loading playlist…", move |client, cache| async move {
-                        let tracks = client.fetch_playlist_tracks(&playlist_id).await?;
+                        let tracks = match playlist_id.strip_prefix("__mix__:") {
+                            Some(track_id) => client.fetch_track_mix(track_id).await?,
+                            None => client.fetch_playlist_tracks(&playlist_id).await?,
+                        };
                         cache.lock().unwrap().playlists.insert(playlist_id, tracks.clone());
                         Ok(UiEvent::TracksLoaded(tracks))
                     }),
@@ -2644,6 +2661,13 @@ async fn audio_worker_loop(
                         Ok(UiEvent::AlbumLoaded(fetch_album_cached(&client, &cache, &album_id).await?))
                     }),
                 }
+            }
+            Command::StartMix(track_id) => {
+                api.run("Loading mix…", move |client, cache| async move {
+                    let tracks = client.fetch_track_mix(&track_id).await?;
+                    cache.lock().unwrap().playlists.insert(format!("__mix__:{track_id}"), tracks.clone());
+                    Ok(UiEvent::MixLoaded(tracks))
+                });
             }
             Command::AddToPlaylist { playlist_id, playlist_title, track_id } => {
                 api.run("Adding to playlist…", move |client, cache| async move {

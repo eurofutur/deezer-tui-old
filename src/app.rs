@@ -35,6 +35,8 @@ pub enum Command {
     LoadFavoriteArtists,
     LoadArtist(String),
     LoadAlbum(String),
+    /// Deezer's track mix (radio seeded by a track), played right away.
+    StartMix(String),
     AddToPlaylist {
         playlist_id: String,
         playlist_title: String,
@@ -70,6 +72,8 @@ pub enum UiEvent {
     /// Playlists the user owns (targets of "Add to playlist").
     OwnPlaylistsLoaded(Vec<(String, String)>),
     TracksLoaded(Vec<(String, String, String)>),
+    /// A track mix: shown like a playlist and played from its first track.
+    MixLoaded(Vec<(String, String, String)>),
     SearchResultsLoaded {
         tracks: Vec<(String, String, String)>,
         playlists: Vec<(String, String)>,
@@ -206,6 +210,8 @@ pub struct ContextMenu {
     pub y: u16,
     pub selected: usize,
     pub page: MenuPage,
+    /// Position in the queue when opened on a queue row ("Remove from queue").
+    pub queue_pos: Option<usize>,
 }
 
 /// Full-size variant of a Deezer image url.
@@ -314,6 +320,8 @@ pub struct App {
     pub repeat_mode: RepeatMode,
     pub viewing_settings: bool,
     pub current_playlist_id: Option<String>,
+    /// Seed track (id, title) of the last mix, for the track list header.
+    pub mix_seed: Option<(String, String)>,
     pub status_message: String,
     pub is_searching: bool,
     pub search_query: String,
@@ -358,8 +366,13 @@ pub struct App {
     /// Wallpaper palette (None until DMS has written it).
     pub matugen: Option<MatugenColors>,
     pub logo_hover: bool,
-    /// Previous views, most recent last (Esc pops one).
+    /// Previous views, most recent last (Esc / PageUp pops one).
     pub history: Vec<ViewState>,
+    /// Views left by going back, most recent last (PageDown pops one).
+    pub forward: Vec<ViewState>,
+    /// Track list or album currently displayed (current_playlist_id is
+    /// updated before the new list arrives, so it cannot tell).
+    pub shown_view: Option<ViewState>,
     /// Set while restoring a view from the history so it is not pushed again.
     pub navigating_back: bool,
 }
@@ -411,6 +424,7 @@ impl App {
             repeat_mode: RepeatMode::Off,
             viewing_settings: false,
             current_playlist_id: None,
+            mix_seed: None,
             status_message: "Status: Waiting...".into(),
             is_searching: false,
             search_query: String::new(),
@@ -443,6 +457,8 @@ impl App {
             matugen: None,
             logo_hover: false,
             history: Vec::new(),
+            forward: Vec::new(),
+            shown_view: None,
             navigating_back: false,
         }
     }
@@ -714,6 +730,8 @@ impl App {
             ViewState::Library(view)
         } else if self.showing_search_results {
             ViewState::Search
+        } else if let Some(view @ (ViewState::Tracks(_) | ViewState::Album(_))) = &self.shown_view {
+            view.clone()
         } else if let Some(id) = self.current_playlist_id.as_deref().and_then(|s| s.strip_prefix("__album__:")) {
             ViewState::Album(id.to_owned())
         } else {
@@ -723,12 +741,17 @@ impl App {
 
     /// Push the current view onto the history before switching to `next`.
     pub fn remember_view(&mut self, next: &ViewState) {
+        let current = self.current_view();
+        self.shown_view = Some(next.clone());
         if self.navigating_back {
             self.navigating_back = false;
             return;
         }
-        let current = self.current_view();
-        if current == *next || matches!(current, ViewState::Tracks(None)) && self.current_tracks.is_empty() {
+        if current == *next {
+            return;
+        }
+        self.forward.clear();
+        if matches!(current, ViewState::Tracks(None)) && self.current_tracks.is_empty() {
             return;
         }
         if self.history.last() != Some(&current) {
@@ -942,17 +965,94 @@ impl App {
         }
     }
 
-    pub fn open_track_menu(&mut self, track: (String, String, String), x: u16, y: u16) {
-        self.context_menu = Some(ContextMenu { track, x, y, selected: 0, page: MenuPage::Main });
+    /// Launch Deezer's mix seeded by `track` (its tracks replace the queue).
+    pub fn start_mix(&mut self, track: (String, String, String)) {
+        self.current_playlist_id = Some(format!("__mix__:{}", track.0));
+        self.status_message = format!("Starting mix: {}", track.1);
+        self.mix_seed = Some((track.0.clone(), track.1));
+        let _ = self.command_sender.send(Command::StartMix(track.0));
+    }
+
+    /// Show a freshly loaded track list in the main panel.
+    pub fn show_tracks(&mut self, tracks: Vec<(String, String, String)>) {
+        self.loading = None;
+        self.remember_view(&ViewState::Tracks(self.current_playlist_id.clone()));
+        self.current_tracks = tracks;
+        self.showing_search_results = false;
+        self.leave_special_views();
+        self.search_playlists.clear();
+        self.search_artists.clear();
+        if self.current_tracks.is_empty() {
+            self.status_message = "No tracks found for this playlist/search".into();
+        } else {
+            self.status_message = format!("Loaded {} tracks", self.current_tracks.len());
+        }
+        self.main_state.select(Some(0));
+        self.viewing_settings = false;
+        self.active_panel = ActivePanel::Main;
+    }
+
+    /// Replace the queue with the current track list and play its first track.
+    pub fn play_current_tracks(&mut self) {
+        let Some((track_id, title, _)) = self.current_tracks.first().cloned() else { return };
+        self.queue_tracks = self.current_tracks.clone();
+        self.queue = self.queue_tracks.iter().map(|(_, title, artist)| format!("{} - {}", title, artist)).collect();
+        self.queue_state.select(Some(0));
+        self.queue_index = Some(0);
+        let _ = self.command_sender.send(Command::PlayTrack(track_id));
+        self.is_playing = true;
+        self.status_message = format!("Playing mix: {title}");
+    }
+
+    pub fn open_track_menu(&mut self, track: (String, String, String), x: u16, y: u16, queue_pos: Option<usize>) {
+        self.context_menu = Some(ContextMenu { track, x, y, selected: 0, page: MenuPage::Main, queue_pos });
+    }
+
+    /// Drop queue item `pos`; removing the playing track skips to the next one.
+    pub fn remove_from_queue(&mut self, pos: usize) {
+        if pos >= self.queue_tracks.len() {
+            return;
+        }
+        let (_, title, _) = self.queue_tracks.remove(pos);
+        if pos < self.queue.len() {
+            self.queue.remove(pos);
+        }
+        match self.queue_index {
+            Some(i) if i > pos => self.queue_index = Some(i - 1),
+            Some(i) if i == pos => match self.queue_tracks.get(pos) {
+                Some((next_id, _, _)) => {
+                    let _ = self.command_sender.send(Command::PlayTrack(next_id.clone()));
+                    self.is_playing = true;
+                }
+                None => {
+                    let _ = self.command_sender.send(Command::Pause);
+                    self.is_playing = false;
+                    self.queue_index = None;
+                }
+            },
+            _ => {}
+        }
+        let len = self.queue_tracks.len();
+        if let Some(sel) = self.queue_state.selected() {
+            self.queue_state.select(if len == 0 { None } else { Some(sel.min(len - 1)) });
+        }
+        self.status_message = format!("Removed from queue: {title}");
     }
 
     pub fn menu_items(&self) -> Vec<String> {
         match self.context_menu.as_ref().map(|m| &m.page) {
-            Some(MenuPage::Main) => vec![
-                "▶  Play next".to_string(),
-                "≡  Add to queue".to_string(),
-                "＋  Add to playlist   ▸".to_string(),
-            ],
+            Some(MenuPage::Main) => {
+                let mut items = vec![
+                    "▶  Play next".to_string(),
+                    "≡  Add to queue".to_string(),
+                    "◎  Start mix".to_string(),
+                    "＋  Add to playlist   ▸".to_string(),
+                ];
+                if self.context_menu.as_ref().is_some_and(|m| m.queue_pos.is_some()) {
+                    items.push("✕  Remove from queue".to_string());
+                }
+                items
+            }
             Some(MenuPage::Playlists) => {
                 let mut items = vec!["◂  Back".to_string()];
                 if self.own_playlists.is_empty() {
@@ -979,7 +1079,7 @@ impl App {
         if let Some(menu) = self.context_menu.as_mut() {
             if menu.page == MenuPage::Playlists {
                 menu.page = MenuPage::Main;
-                menu.selected = 2;
+                menu.selected = 3;
             } else {
                 self.context_menu = None;
             }
@@ -997,6 +1097,16 @@ impl App {
                 1 => {
                     self.context_menu = None;
                     self.enqueue(menu.track, false);
+                }
+                2 => {
+                    self.context_menu = None;
+                    self.start_mix(menu.track);
+                }
+                4 => {
+                    self.context_menu = None;
+                    if let Some(pos) = menu.queue_pos {
+                        self.remove_from_queue(pos);
+                    }
                 }
                 _ => {
                     if let Some(m) = self.context_menu.as_mut() {

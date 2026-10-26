@@ -823,6 +823,14 @@ impl DeezerClient {
         Ok(entries)
     }
 
+    /// Deezer's mix seeded by a track, that track first (gateway `song.getSearchTrackMix`).
+    pub async fn fetch_track_mix(&self, track_id: &str) -> Result<Vec<(String, String, String)>> {
+        let json = self
+            .gw_post("song.getSearchTrackMix", json!({ "sng_id": track_id, "start_with_input_track": true }))
+            .await?;
+        Ok(extract_tracks_recursive(&json["results"]["data"], 200))
+    }
+
     /// Add one track to a playlist the user owns (gateway `playlist.addSongs`).
     pub async fn add_track_to_playlist(&self, playlist_id: &str, track_id: &str) -> Result<()> {
         let json = self

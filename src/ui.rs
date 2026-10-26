@@ -902,6 +902,14 @@ fn render_track_list(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &
             .map(|(_, title, artist)| format!("{title} · {artist}"))
             .unwrap_or_else(|| "Album".to_string());
         (name, "Album".to_string())
+    } else if let Some(id) = source.strip_prefix("__mix__:") {
+        let name = app
+            .mix_seed
+            .as_ref()
+            .filter(|(sid, _)| sid == id)
+            .map(|(_, title)| format!("Mix · {title}"))
+            .unwrap_or_else(|| "Mix".to_string());
+        (name, "Track mix".to_string())
     } else {
         let name = app
             .playlists
@@ -1359,15 +1367,17 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
             ActivePanel::Search => {}
         }
     }
-    let global: [(&str, &str); 11] = [
+    let global: [(&str, &str); 13] = [
         ("Tab", "Next panel"),
         ("S-Tab", "Previous panel"),
         ("j k", "Move"),
+        ("PgUp/Dn", "Back / forward"),
         ("/", "Search"),
         ("p", "Play / pause"),
         ("a", "Artist of track"),
         ("e", "Album of track"),
-        ("m", "Track menu"),
+        ("m", "Mix from track"),
+        ("M", "Track menu"),
         ("z", "Play next"),
         ("t", "Theme"),
         ("q", "Quit"),
