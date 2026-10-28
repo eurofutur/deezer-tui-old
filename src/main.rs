@@ -28,7 +28,7 @@ use base64::Engine;
 use app::{ActivePanel, App, ArtistRow, Command, Hit, LibraryView, NowPlaying, RepeatMode, SearchCategory, UiEvent, ViewState};
 use std::collections::VecDeque;
 use config::{AudioQuality, Config, Theme};
-use api::{AlbumPage, ArtistPage, ArtistRef, HistoryEntry, LibraryAlbum};
+use api::{AlbumPage, ArtistPage, ArtistRef, BrowsePage, HistoryEntry, LibraryAlbum};
 use std::collections::HashMap;
 use std::sync::Arc;
 use state::PlaybackState;
@@ -335,23 +335,20 @@ fn restore_view(app: &mut App, view: ViewState) {
         ViewState::Album(id) => {
             let _ = app.command_sender.send(Command::LoadAlbum(id));
         }
+        ViewState::Page(path) => {
+            let _ = app.command_sender.send(Command::LoadPage(path));
+        }
         ViewState::Tracks(source) => {
             let cmd = match source.as_deref() {
-                Some("__home__") => Command::LoadHome,
-                Some("__explore__") => Command::LoadExplore,
                 Some(id) if !id.is_empty() => {
                     app.current_playlist_id = Some(id.to_owned());
                     Command::LoadPlaylist(id.to_owned())
                 }
-                _ => Command::LoadFavorites,
+                _ => {
+                    app.current_playlist_id = None;
+                    Command::LoadFavorites
+                }
             };
-            if matches!(cmd, Command::LoadHome | Command::LoadExplore | Command::LoadFavorites) {
-                app.current_playlist_id = match cmd {
-                    Command::LoadHome => Some("__home__".into()),
-                    Command::LoadExplore => Some("__explore__".into()),
-                    _ => None,
-                };
-            }
             let _ = app.command_sender.send(cmd);
         }
     }
@@ -1174,7 +1171,9 @@ async fn run_tui_loop(
                             }
                         }
                         KeyCode::Right if !app.is_searching => {
-                            if app.active_panel == ActivePanel::Main && app.viewing_artist {
+                            if app.active_panel == ActivePanel::Main && app.browse.is_some() {
+                                app.browse_move_h(1);
+                            } else if app.active_panel == ActivePanel::Main && app.viewing_artist {
                                 app.artist_tab_next();
                             } else if app.active_panel == ActivePanel::Main && app.showing_search_results {
                                 app.switch_search_category_right();
@@ -1234,21 +1233,12 @@ async fn run_tui_loop(
                                 ActivePanel::Navigation => {
                                     let nav_idx = app.nav_state.selected().unwrap_or(0);
                                     match nav_idx {
-                                        0 => {
+                                        0 | 1 => {
+                                            let path = if nav_idx == 0 { "home" } else { "channels/explore" };
                                             app.command_sender
-                                                .send(Command::LoadHome)
-                                                .map_err(|_| anyhow!("failed to send load home command"))?;
-                                            app.current_playlist_id = Some("__home__".to_string());
+                                                .send(Command::LoadPage(path.into()))
+                                                .map_err(|_| anyhow!("failed to send load page command"))?;
                                             app.active_panel = ActivePanel::Main;
-                                            app.status_message = "Loading Home recommendations...".into();
-                                        }
-                                        1 => {
-                                            app.command_sender
-                                                .send(Command::LoadExplore)
-                                                .map_err(|_| anyhow!("failed to send load explore command"))?;
-                                            app.current_playlist_id = Some("__explore__".to_string());
-                                            app.active_panel = ActivePanel::Main;
-                                            app.status_message = "Loading Explore recommendations...".into();
                                         }
                                         2 => {
                                             app.command_sender
@@ -1395,6 +1385,8 @@ async fn run_tui_loop(
                                                 _ => {}
                                             }
                                         }
+                                    } else if app.browse.is_some() {
+                                        app.browse_open();
                                     } else if app.viewing_artist {
                                         let row = app.selected_artist_row().cloned();
                                         let page = app.artist_page.clone();
@@ -1703,6 +1695,7 @@ async fn run_tui_loop(
                     app.main_state.select(Some(0));
                     app.active_panel = ActivePanel::Main;
                 }
+                UiEvent::PageLoaded(page) => app.show_browse(page),
                 UiEvent::ArtistLoaded(page) => {
                     app.loading = None;
                     app.remember_view(&ViewState::Artist(page.id.clone()));
@@ -2107,7 +2100,13 @@ fn handle_mouse(
                         }
                     }
                 }
-                Hit::ArtistTab(_) | Hit::SearchCategory(_) => app.active_panel = ActivePanel::Main,
+                Hit::ArtistTab(_) | Hit::SearchCategory(_) | Hit::BrowseMore(_) | Hit::BrowseScroll { .. } => {
+                    app.active_panel = ActivePanel::Main
+                }
+                Hit::BrowseItem { section, item } => {
+                    app.active_panel = ActivePanel::Main;
+                    app.browse_select(section, item);
+                }
                 Hit::PlayerButton(i) => {
                     app.active_panel = ActivePanel::Player;
                     app.player_button_index = i;
@@ -2265,6 +2264,13 @@ fn handle_mouse(
                     app.search_category = cat;
                     app.main_state.select(Some(0));
                 }
+                Hit::BrowseItem { section, item } => {
+                    app.active_panel = ActivePanel::Main;
+                    app.browse_select(section, item);
+                    app.browse_open();
+                }
+                Hit::BrowseMore(section) => app.browse_more(section),
+                Hit::BrowseScroll { section, forward } => app.browse_page(section, forward),
                 Hit::PlayerButton(i) => {
                     app.active_panel = ActivePanel::Player;
                     app.player_button_index = i;
@@ -2325,6 +2331,7 @@ struct ApiCache {
     searches: HashMap<String, (Vec<(String, String, String)>, Vec<(String, String)>, Vec<(String, String)>)>,
     library_albums: Option<Vec<LibraryAlbum>>,
     library_artists: Option<Vec<ArtistRef>>,
+    pages: HashMap<String, BrowsePage>,
 }
 
 const FAVORITES_KEY: &str = "__favorites__";
@@ -2631,38 +2638,30 @@ async fn audio_worker_loop(
                         let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
                     }
                     None => api.run("Loading playlist…", move |client, cache| async move {
-                        let tracks = match playlist_id.strip_prefix("__mix__:") {
-                            Some(track_id) => client.fetch_track_mix(track_id).await?,
-                            None => client.fetch_playlist_tracks(&playlist_id).await?,
+                        let tracks = if let Some(track_id) = playlist_id.strip_prefix("__mix__:") {
+                            client.fetch_track_mix(track_id).await?
+                        } else if let Some(id) = playlist_id.strip_prefix("__stl__:") {
+                            client.fetch_smart_tracklist(id).await?
+                        } else if let Some(id) = playlist_id.strip_prefix("__flow__:") {
+                            client.fetch_flow(id).await?
+                        } else {
+                            client.fetch_playlist_tracks(&playlist_id).await?
                         };
                         cache.lock().unwrap().playlists.insert(playlist_id, tracks.clone());
                         Ok(UiEvent::TracksLoaded(tracks))
                     }),
                 }
             }
-            Command::LoadHome => {
-                let cached = api.cache.lock().unwrap().playlists.get("__home__").cloned();
+            Command::LoadPage(path) => {
+                let cached = api.cache.lock().unwrap().pages.get(&path).cloned();
                 match cached {
-                    Some(tracks) => {
-                        let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
+                    Some(page) => {
+                        let _ = event_tx.send(UiEvent::PageLoaded(page));
                     }
-                    None => api.run("Loading Home…", |client, cache| async move {
-                        let tracks = client.fetch_home_tracks().await?;
-                        cache.lock().unwrap().playlists.insert("__home__".to_owned(), tracks.clone());
-                        Ok(UiEvent::TracksLoaded(tracks))
-                    }),
-                }
-            }
-            Command::LoadExplore => {
-                let cached = api.cache.lock().unwrap().playlists.get("__explore__").cloned();
-                match cached {
-                    Some(tracks) => {
-                        let _ = event_tx.send(UiEvent::TracksLoaded(tracks));
-                    }
-                    None => api.run("Loading Explore…", |client, cache| async move {
-                        let tracks = client.fetch_explore_tracks().await?;
-                        cache.lock().unwrap().playlists.insert("__explore__".to_owned(), tracks.clone());
-                        Ok(UiEvent::TracksLoaded(tracks))
+                    None => api.run("Loading…", move |client, cache| async move {
+                        let page = client.fetch_page(&path).await?;
+                        cache.lock().unwrap().pages.insert(path, page.clone());
+                        Ok(UiEvent::PageLoaded(page))
                     }),
                 }
             }
@@ -2706,6 +2705,12 @@ async fn audio_worker_loop(
                     let tracks = client.fetch_track_mix(&track_id).await?;
                     cache.lock().unwrap().playlists.insert(format!("__mix__:{track_id}"), tracks.clone());
                     Ok(UiEvent::MixLoaded(tracks))
+                });
+            }
+            // Not cached: each start of a Flow brings a fresh batch.
+            Command::StartFlow(config_id) => {
+                api.run("Loading Flow…", move |client, _| async move {
+                    Ok(UiEvent::MixLoaded(client.fetch_flow(&config_id).await?))
                 });
             }
             Command::AddToPlaylist { playlist_id, playlist_title, track_id } => {
@@ -3235,8 +3240,9 @@ fn apply_resume(app: &mut App, history: &[HistoryEntry]) {
     // Re-open the view the track was launched from so the main panel matches.
     if let Some(source) = local.current_playlist_id.as_deref() {
         let cmd = match source {
-            "__home__" => Some(Command::LoadHome),
-            "__explore__" => Some(Command::LoadExplore),
+            // Sources saved before Home / Explore became web pages.
+            "__home__" => Some(Command::LoadPage("home".into())),
+            "__explore__" => Some(Command::LoadPage("channels/explore".into())),
             s if s.starts_with("__album__:") => Some(Command::LoadAlbum(s["__album__:".len()..].to_owned())),
             s if s.starts_with("__artist__:") => Some(Command::LoadArtist(s["__artist__:".len()..].to_owned())),
             id if !id.is_empty() => Some(Command::LoadPlaylist(id.to_owned())),

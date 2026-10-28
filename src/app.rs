@@ -5,7 +5,7 @@ use std::time::Instant;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
-use crate::api::{AlbumPage, ArtistPage, ArtistRef, HistoryEntry, LibraryAlbum};
+use crate::api::{AlbumPage, ArtistPage, ArtistRef, BrowsePage, HistoryEntry, LibraryAlbum};
 use crate::config::{AudioQuality, Config};
 use crate::state::PlaybackState;
 use crate::theme::MatugenColors;
@@ -28,13 +28,15 @@ pub enum Command {
     SetCrossfade { enabled: bool, duration_ms: u64 },
     ToggleCrossfade,
     LoadPlaylist(String),
-    LoadHome,
-    LoadExplore,
     LoadFavorites,
     LoadFavoriteAlbums,
     LoadFavoriteArtists,
     LoadArtist(String),
     LoadAlbum(String),
+    /// A web page (Home, Explore, a genre, "See all") by its path.
+    LoadPage(String),
+    /// A Flow (default or mood / genre), played right away.
+    StartFlow(String),
     /// Deezer's track mix (radio seeded by a track), played right away.
     StartMix(String),
     AddToPlaylist {
@@ -85,6 +87,7 @@ pub enum UiEvent {
     Loading(Option<String>),
     ArtistLoaded(ArtistPage),
     AlbumLoaded(AlbumPage),
+    PageLoaded(BrowsePage),
     FavoriteAlbumsLoaded(Vec<LibraryAlbum>),
     FavoriteArtistsLoaded(Vec<ArtistRef>),
     /// Result of an update check: Some(release) when a newer one exists.
@@ -164,6 +167,8 @@ pub enum ViewState {
     Library(LibraryView),
     Search,
     Settings,
+    /// A web page (Home, Explore…) by its path.
+    Page(String),
 }
 
 /// What a mouse click on a screen region means. Regions are recorded by the
@@ -196,6 +201,12 @@ pub enum Hit {
     SplitCycle,
     /// An artwork; hovering shows a large preview (url of the full-size image).
     Image(String),
+    /// A card of a web page: hover selects, click opens.
+    BrowseItem { section: usize, item: usize },
+    /// "See all" of a web page section.
+    BrowseMore(usize),
+    /// ‹ / › arrows of a carousel.
+    BrowseScroll { section: usize, forward: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +335,8 @@ pub struct App {
     pub current_playlist_id: Option<String>,
     /// Seed track (id, title) of the last mix, for the track list header.
     pub mix_seed: Option<(String, String)>,
+    /// (source id, title) of a mix or Flow opened from a web page, for the header.
+    pub list_title: Option<(String, String)>,
     pub status_message: String,
     /// Newer Codeberg release found by the update check.
     pub update: Option<crate::update::Release>,
@@ -346,6 +359,17 @@ pub struct App {
     pub library_view: Option<LibraryView>,
     pub library_albums: Vec<LibraryAlbum>,
     pub library_artists: Vec<ArtistRef>,
+    /// Web page (Home, Explore…) shown in the main panel.
+    pub browse: Option<BrowsePage>,
+    /// Selected card (section, item) and first visible card of each carousel.
+    pub browse_sel: (usize, usize),
+    pub browse_offsets: Vec<usize>,
+    /// Cards per row, as laid out by the last frame.
+    pub browse_cols: usize,
+    /// First line of the page shown (kept by the renderer around the selection).
+    pub browse_scroll: u16,
+    /// Artworks of the cards on screen (set by the renderer).
+    pub browse_visible: Vec<String>,
     /// Decoded thumbnails keyed by URL, shared by the artist page and the detail card.
     pub images: HashMap<String, image::DynamicImage>,
     pub pending_images: HashSet<String>,
@@ -446,6 +470,13 @@ impl App {
             library_view: None,
             library_albums: vec![],
             library_artists: vec![],
+            browse: None,
+            browse_sel: (0, 0),
+            browse_offsets: vec![],
+            browse_cols: 1,
+            browse_scroll: 0,
+            browse_visible: vec![],
+            list_title: None,
             images: HashMap::new(),
             pending_images: HashSet::new(),
             images_png: HashMap::new(),
@@ -514,6 +545,10 @@ impl App {
                 self.active_panel = ActivePanel::Main;
             }
             ActivePanel::Main => {
+                if self.browse.is_some() {
+                    self.browse_move_v(true);
+                    return;
+                }
                 if self.viewing_artist {
                     let current = self.main_state.selected().unwrap_or(0);
                     if let Some(next) = self
@@ -617,6 +652,10 @@ impl App {
                 self.active_panel = ActivePanel::Navigation;
             }
             ActivePanel::Main => {
+                if self.browse.is_some() {
+                    self.browse_move_v(false);
+                    return;
+                }
                 if self.viewing_artist {
                     let current = self.main_state.selected().unwrap_or(0);
                     match self.artist_rows[..current.min(self.artist_rows.len())]
@@ -695,7 +734,9 @@ impl App {
     pub fn handle_left(&mut self) {
         match self.active_panel {
             ActivePanel::Main => {
-                if self.viewing_artist {
+                if self.browse.is_some() && self.browse_sel.1 > 0 {
+                    self.browse_move_h(-1);
+                } else if self.viewing_artist {
                     self.artist_tab_prev();
                 } else if self.showing_search_results {
                     self.search_category = match self.search_category {
@@ -729,6 +770,8 @@ impl App {
     pub fn current_view(&self) -> ViewState {
         if self.viewing_settings {
             ViewState::Settings
+        } else if let Some(page) = &self.browse {
+            ViewState::Page(page.path.clone())
         } else if self.viewing_artist {
             ViewState::Artist(self.artist_page.as_ref().map(|p| p.id.clone()).unwrap_or_default())
         } else if let Some(view) = self.library_view {
@@ -771,6 +814,140 @@ impl App {
     pub fn leave_special_views(&mut self) {
         self.viewing_artist = false;
         self.library_view = None;
+        self.browse = None;
+    }
+
+    /// Show a freshly loaded web page (Home, Explore, a genre, "See all").
+    pub fn show_browse(&mut self, page: BrowsePage) {
+        self.loading = None;
+        self.remember_view(&ViewState::Page(page.path.clone()));
+        self.leave_special_views();
+        self.viewing_settings = false;
+        self.showing_search_results = false;
+        self.status_message = page.title.clone();
+        self.browse_offsets = vec![0; page.sections.len()];
+        self.browse_sel = (0, 0);
+        self.browse_scroll = 0;
+        self.browse = Some(page);
+        self.active_panel = ActivePanel::Main;
+    }
+
+    /// Move the card selection by `delta` inside the current section,
+    /// scrolling its carousel to keep the card visible.
+    pub fn browse_move_h(&mut self, delta: i32) {
+        let Some(page) = self.browse.as_ref() else { return };
+        let (s, i) = self.browse_sel;
+        let Some(section) = page.sections.get(s) else { return };
+        let item = (i as i32 + delta).clamp(0, section.items.len() as i32 - 1) as usize;
+        self.browse_select(s, item);
+    }
+
+    /// Select a card and scroll its carousel so it is visible.
+    pub fn browse_select(&mut self, section: usize, item: usize) {
+        let cols = self.browse_cols.max(1);
+        self.browse_sel = (section, item);
+        if let Some(off) = self.browse_offsets.get_mut(section) {
+            if item < *off {
+                *off = item;
+            } else if item >= *off + cols {
+                *off = item + 1 - cols;
+            }
+        }
+    }
+
+    /// Scroll a carousel by one screen, like the web's ‹ › arrows.
+    pub fn browse_page(&mut self, section: usize, forward: bool) {
+        let cols = self.browse_cols.max(1);
+        let Some(len) = self.browse.as_ref().and_then(|p| p.sections.get(section)).map(|s| s.items.len()) else { return };
+        let off = self.browse_offsets.get(section).copied().unwrap_or(0);
+        let off = if forward { (off + cols).min(len.saturating_sub(cols)) } else { off.saturating_sub(cols) };
+        self.browse_offsets[section] = off;
+        self.browse_sel = (section, off);
+    }
+
+    /// Up / down: next row of a grid, else the next section, keeping the column.
+    pub fn browse_move_v(&mut self, down: bool) {
+        let cols = self.browse_cols.max(1);
+        let Some(page) = self.browse.as_ref() else { return };
+        let (s, i) = self.browse_sel;
+        let shape = |n: usize| page.sections.get(n).map(|sec| (sec.grid, sec.items.len()));
+        let Some((grid, len)) = shape(s) else { return };
+        let next = if down { Some(s + 1) } else { s.checked_sub(1) };
+        let target = next.and_then(shape);
+        if grid {
+            if down && i + cols < len {
+                return self.browse_select(s, i + cols);
+            }
+            if !down && i >= cols {
+                return self.browse_select(s, i - cols);
+            }
+        }
+        let column = if grid { i % cols } else { i.saturating_sub(self.browse_offsets[s]) };
+        let (next, Some((target_grid, len))) = (next.unwrap_or(0), target) else {
+            if !down {
+                self.active_panel = ActivePanel::Search;
+            }
+            return;
+        };
+        let item = if !target_grid {
+            self.browse_offsets[next] + column
+        } else if down {
+            column
+        } else {
+            (len - 1) / cols * cols + column
+        };
+        self.browse_select(next, item.min(len - 1));
+    }
+
+    /// Open the selected card, like a click on the web.
+    pub fn browse_open(&mut self) {
+        let Some(page) = self.browse.as_ref() else { return };
+        let (s, i) = self.browse_sel;
+        let Some(section) = page.sections.get(s) else { return };
+        let Some(item) = section.items.get(i).cloned() else { return };
+        let cmd = match item.kind.as_str() {
+            "album" => Command::LoadAlbum(item.id),
+            "artist" => Command::LoadArtist(item.id),
+            "channel" => Command::LoadPage(item.target),
+            "playlist" => {
+                self.current_playlist_id = Some(item.id.clone());
+                Command::LoadPlaylist(item.id)
+            }
+            "smarttracklist" => {
+                let source = format!("__stl__:{}", item.id);
+                self.list_title = Some((source.clone(), item.title));
+                self.current_playlist_id = Some(source.clone());
+                Command::LoadPlaylist(source)
+            }
+            "flow" => {
+                let source = format!("__flow__:{}", item.id);
+                self.list_title = Some((source.clone(), item.title));
+                self.current_playlist_id = Some(source);
+                Command::StartFlow(item.id)
+            }
+            _ => {
+                // Track cards: play them in order, from the chosen one.
+                self.current_tracks = section
+                    .items
+                    .iter()
+                    .filter(|t| t.kind == "track")
+                    .map(|t| (t.id.clone(), t.title.clone(), t.subtitle.clone()))
+                    .collect();
+                let start = self.current_tracks.iter().position(|t| t.0 == item.id).unwrap_or(0);
+                self.current_tracks.rotate_left(start);
+                self.play_current_tracks();
+                return;
+            }
+        };
+        let _ = self.command_sender.send(cmd);
+    }
+
+    /// "See all" of a section.
+    pub fn browse_more(&mut self, section: usize) {
+        let more = self.browse.as_ref().and_then(|p| p.sections.get(section)).and_then(|s| s.more.clone());
+        if let Some(path) = more {
+            let _ = self.command_sender.send(Command::LoadPage(path));
+        }
     }
 
     pub fn show_artist(&mut self, page: ArtistPage) {
@@ -778,6 +955,7 @@ impl App {
         self.artist_tab = ArtistTab::Discography;
         self.viewing_artist = true;
         self.library_view = None;
+        self.browse = None;
         self.viewing_settings = false;
         self.showing_search_results = false;
         self.rebuild_artist_rows();
@@ -787,6 +965,7 @@ impl App {
     pub fn show_library(&mut self, view: LibraryView) {
         self.library_view = Some(view);
         self.viewing_artist = false;
+        self.browse = None;
         self.viewing_settings = false;
         self.showing_search_results = false;
         self.main_state.select(Some(0));
@@ -842,6 +1021,10 @@ impl App {
     /// What the right-hand detail card should show for the current selection:
     /// (image url, title, subtitle).
     pub fn selected_detail(&self) -> Option<(Option<String>, String, String)> {
+        if let Some(page) = &self.browse {
+            let item = page.sections.get(self.browse_sel.0)?.items.get(self.browse_sel.1)?;
+            return Some((item.picture_url.clone(), item.title.clone(), item.subtitle.clone()));
+        }
         if self.viewing_artist {
             let page = self.artist_page.as_ref()?;
             let fans = format!("{} fans", fmt_count(page.nb_fan));
@@ -896,6 +1079,9 @@ impl App {
     /// Image URLs the current screen wants decoded (downloaded lazily by main).
     pub fn wanted_images(&self) -> Vec<String> {
         let mut urls = Vec::new();
+        if self.browse.is_some() {
+            urls.extend(self.browse_visible.iter().cloned());
+        }
         if self.viewing_artist {
             if let Some(url) = self.artist_page.as_ref().and_then(|p| p.picture_url.clone()) {
                 urls.push(url);
@@ -918,7 +1104,7 @@ impl App {
 
     /// The track shown on a given row of the main list, if that row is a track.
     pub fn track_at_main_row(&self, index: usize) -> Option<(String, String, String)> {
-        if self.viewing_settings || self.library_view.is_some() {
+        if self.viewing_settings || self.library_view.is_some() || self.browse.is_some() {
             return None;
         }
         if self.viewing_artist {

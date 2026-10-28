@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, USER_AGENT};
 use serde_json::{json, Value};
-use std::{collections::HashSet, env, fs};
+use std::collections::HashSet;
 use crate::config::AudioQuality;
 
 const GATEWAY_URL: &str = "https://www.deezer.com/ajax/gw-light.php";
@@ -148,6 +148,42 @@ pub struct AlbumPage {
     pub artist_id: Option<String>,
     pub cover_url: Option<String>,
     pub tracks: Vec<(String, String, String)>,
+}
+
+/// A card of a Deezer web page (Home, Explore, a genre channel…).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowseItem {
+    /// album, playlist, artist, smarttracklist, flow, channel or track.
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub picture_url: Option<String>,
+    /// Page path for channels ("channels/alternative").
+    pub target: String,
+    /// "dd/mm/yyyy" for albums.
+    pub released: String,
+    pub explicit: bool,
+    /// Tile colour of channels.
+    pub color: Option<(u8, u8, u8)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowseSection {
+    pub title: String,
+    /// "See all" page path, when the web shows that button.
+    pub more: Option<String>,
+    /// Wrapped grid (Explore categories) instead of a one-row carousel.
+    pub grid: bool,
+    pub items: Vec<BrowseItem>,
+}
+
+/// A page of the web app (gateway `page.get`), as stacked sections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowsePage {
+    pub path: String,
+    pub title: String,
+    pub sections: Vec<BrowseSection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -535,6 +571,10 @@ impl DeezerClient {
 
     /// POST to the gateway with the session cookie, like the page* calls above.
     async fn gw_post(&self, method: &str, payload: Value) -> Result<Value> {
+        self.gw_post_query(method, &[], payload).await
+    }
+
+    async fn gw_post_query(&self, method: &str, query: &[(&str, &str)], payload: Value) -> Result<Value> {
         let api_token = self
             .api_token
             .as_deref()
@@ -545,6 +585,7 @@ impl DeezerClient {
                 "{GATEWAY_URL}?method={method}&api_version=1.0&api_token={api_token}"
             ))
             .query(&[("input", "3")])
+            .query(query)
             .header(
                 reqwest::header::COOKIE,
                 format!("arl={}; sid={}", self.arl, self.session_id),
@@ -821,6 +862,64 @@ impl DeezerClient {
             .collect();
 
         Ok(entries)
+    }
+
+    /// A web page ("home", "channels/explore", "channels/module/<id>"…) as the
+    /// site renders it. `page.get` only reads its input from the query string.
+    pub async fn fetch_page(&self, path: &str) -> Result<BrowsePage> {
+        const KINDS: [&str; 7] = ["album", "playlist", "artist", "smarttracklist", "flow", "channel", "track"];
+        let input = json!({
+            "PAGE": path,
+            "VERSION": "2.5",
+            "SUPPORT": {
+                "grid": KINDS,
+                "horizontal-grid": KINDS,
+                "slideshow": KINDS,
+                "filterable-grid": ["flow"],
+            },
+            "LANG": "en",
+        })
+        .to_string();
+        let json = self.gw_post_query("page.get", &[("gateway_input", &input)], json!({})).await?;
+        let results = &json["results"];
+        let sections = results["sections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                let items: Vec<BrowseItem> = s["items"].as_array()?.iter().filter_map(browse_item).collect();
+                (!items.is_empty()).then(|| BrowseSection {
+                    title: s["title"].as_str().unwrap_or_default().to_owned(),
+                    more: s["related"]["target"].as_str().map(|t| t.trim_start_matches('/').to_owned()),
+                    grid: s["layout"].as_str() == Some("grid"),
+                    items,
+                })
+            })
+            .collect();
+        Ok(BrowsePage {
+            path: path.to_owned(),
+            title: results["title"].as_str().unwrap_or_default().to_owned(),
+            sections,
+        })
+    }
+
+    /// Tracks of a generated mix ("new-releases", "inspired-by-1"…).
+    pub async fn fetch_smart_tracklist(&self, id: &str) -> Result<Vec<(String, String, String)>> {
+        let json = self
+            .gw_post("smartTracklist.getSongs", json!({ "smartTracklist_id": id, "nb": 100, "start": 0 }))
+            .await?;
+        Ok(extract_tracks_recursive(&json["results"]["data"], 200))
+    }
+
+    /// A batch of Flow (default, or a mood / genre flow like "happy").
+    pub async fn fetch_flow(&self, config_id: &str) -> Result<Vec<(String, String, String)>> {
+        let user_id = self.user_id().ok_or_else(|| anyhow!("user id not loaded"))?;
+        let mut payload = json!({ "user_id": user_id });
+        if config_id != "default" {
+            payload["config_id"] = json!(config_id);
+        }
+        let json = self.gw_post("radio.getUserRadio", payload).await?;
+        Ok(extract_tracks_recursive(&json["results"]["data"], 200))
     }
 
     /// Deezer's mix seeded by a track, that track first (gateway `song.getSearchTrackMix`).
@@ -1149,182 +1248,45 @@ impl DeezerClient {
 
         Ok((tracks, playlists, artists))
     }
-
-    pub async fn fetch_home_tracks(&self) -> Result<Vec<(String, String, String)>> {
-        let (response, raw) = self
-            .authenticated_gateway_call_with_raw(
-                "deezer.pageHome",
-                Some(json!({
-                    "lang": "en",
-                    "nb": 80,
-                    "start": 0
-                })),
-            )
-            .await?;
-
-        write_gateway_debug_dump("home_raw.json", &raw);
-
-        let mut tracks = extract_tracks_recursive(&response["results"], 120);
-        if tracks.is_empty() {
-            tracks = self.fetch_home_tracks_fallback().await?;
-        }
-        Ok(tracks)
-    }
-
-    pub async fn fetch_explore_tracks(&self) -> Result<Vec<(String, String, String)>> {
-        let mut tracks = match self
-            .authenticated_gateway_call_with_raw(
-                "deezer.pageExplore",
-                Some(json!({
-                    "lang": "en",
-                    "nb": 80,
-                    "start": 0
-                })),
-            )
-            .await
-        {
-            Ok((response, raw)) => {
-                write_gateway_debug_dump("explore_raw.json", &raw);
-                extract_tracks_recursive(&response["results"], 120)
-            }
-            Err(err) => {
-                write_gateway_debug_dump("explore_error.json", &json!({"error": err.to_string()}).to_string());
-                Vec::new()
-            }
-        };
-
-        if tracks.is_empty() {
-            // Fallback for accounts/regions where pageExplore does not expose tracks.
-            if let Ok((response, raw)) = self
-                .authenticated_gateway_call_with_raw(
-                    "deezer.pageHome",
-                    Some(json!({
-                        "lang": "en",
-                        "tab": "explore",
-                        "nb": 80,
-                        "start": 0
-                    })),
-                )
-                .await
-            {
-                write_gateway_debug_dump("home_explore_tab_raw.json", &raw);
-                tracks = extract_tracks_recursive(&response["results"], 120);
-            }
-        }
-
-        if tracks.is_empty() {
-            tracks = self.fetch_explore_tracks_fallback().await?;
-        }
-
-        Ok(tracks)
-    }
-
-    async fn fetch_home_tracks_fallback(&self) -> Result<Vec<(String, String, String)>> {
-        let mut out: Vec<(String, String, String)> = Vec::new();
-        let mut seen_track_ids: HashSet<String> = HashSet::new();
-
-        if let Ok(favorites) = self.fetch_favorite_tracks().await {
-            append_unique_tracks(&mut out, &mut seen_track_ids, favorites.into_iter(), 120);
-        }
-
-        if let Some(user_id) = self.user_id() {
-            if let Ok(playlists) = self.fetch_user_playlists(user_id).await {
-                for (playlist_id, _, _) in playlists.into_iter().take(8) {
-                    if out.len() >= 120 {
-                        break;
-                    }
-                    if let Ok(tracks) = self.fetch_playlist_tracks(&playlist_id).await {
-                        append_unique_tracks(
-                            &mut out,
-                            &mut seen_track_ids,
-                            tracks.into_iter().take(20),
-                            120,
-                        );
-                    }
-                }
-            }
-        }
-
-        if out.is_empty() {
-            return Err(anyhow!("home fallback produced no tracks"));
-        }
-        Ok(out)
-    }
-
-    async fn fetch_explore_tracks_fallback(&self) -> Result<Vec<(String, String, String)>> {
-        let mut out: Vec<(String, String, String)> = Vec::new();
-        let mut seen_track_ids: HashSet<String> = HashSet::new();
-
-        let seed_tracks = self.fetch_home_tracks_fallback().await.unwrap_or_default();
-        let mut seen_artists = HashSet::new();
-        let artist_seeds: Vec<String> = seed_tracks
-            .into_iter()
-            .map(|(_, _, artist)| artist)
-            .filter(|artist| seen_artists.insert(artist.to_lowercase()))
-            .take(12)
-            .collect();
-
-        for artist in artist_seeds {
-            if out.len() >= 120 {
-                break;
-            }
-            if let Ok((tracks, _, _)) = self.fetch_search_results(&artist).await {
-                append_unique_tracks(
-                    &mut out,
-                    &mut seen_track_ids,
-                    tracks.into_iter().take(20),
-                    120,
-                );
-            }
-        }
-
-        if out.is_empty() {
-            out = self.fetch_home_tracks_fallback().await?;
-        }
-
-        Ok(out)
-    }
-
 }
 
-fn write_gateway_debug_dump(file_name: &str, raw: &str) {
-    let enabled = env::var("DEEZER_TUI_DEBUG_DUMPS")
-        .ok()
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if !enabled {
-        return;
+/// One card of a `page.get` section; None for kinds the player cannot open
+/// (podcasts, videos, external links).
+fn browse_item(item: &Value) -> Option<BrowseItem> {
+    let kind = item["type"].as_str()?;
+    if !["album", "playlist", "artist", "smarttracklist", "flow", "channel", "track"].contains(&kind) {
+        return None;
     }
-
-    let Some(mut base) = dirs::home_dir() else {
-        return;
+    let data = &item["data"];
+    let pic = if kind == "channel" { &item["image_linked_item"] } else { &item["pictures"][0] };
+    let picture_url = pic["md5"].as_str().and_then(|md5| picture_url(pic["type"].as_str().unwrap_or("cover"), md5, 250));
+    // The web shows the bare artist under albums ("description"), the subtitle elsewhere.
+    let subtitle = match kind {
+        "album" => item["description"].as_str().or(item["subtitle"].as_str()),
+        _ => item["subtitle"].as_str(),
     };
-    base.push(".deezer-tui-debug");
-    if fs::create_dir_all(&base).is_err() {
-        return;
-    }
-
-    let mut path = base;
-    path.push(file_name);
-    let _ = fs::write(path, raw);
-}
-
-fn append_unique_tracks<I>(
-    out: &mut Vec<(String, String, String)>,
-    seen: &mut HashSet<String>,
-    iter: I,
-    limit: usize,
-) where
-    I: Iterator<Item = (String, String, String)>,
-{
-    for (id, title, artist) in iter {
-        if out.len() >= limit {
-            break;
-        }
-        if seen.insert(id.clone()) {
-            out.push((id, title, artist));
-        }
-    }
+    let released = data["ORIGINAL_RELEASE_DATE"]
+        .as_str()
+        .or(data["DIGITAL_RELEASE_DATE"].as_str())
+        .and_then(|d| Some(format!("{}/{}/{}", d.get(8..10)?, d.get(5..7)?, d.get(..4)?)))
+        .unwrap_or_default();
+    // 1 = explicit, 4 = partially explicit: both get the EXPLICIT tag on the web.
+    let explicit = matches!(num(&data["EXPLICIT_ALBUM_CONTENT"]["EXPLICIT_LYRICS_STATUS"]), 1 | 4);
+    let color = item["background_color"]
+        .as_str()
+        .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
+        .map(|c| ((c >> 16) as u8, (c >> 8) as u8, c as u8));
+    Some(BrowseItem {
+        kind: kind.to_owned(),
+        id: str_or_num(&item["id"])?,
+        title: item["title"].as_str().unwrap_or_default().to_owned(),
+        subtitle: subtitle.unwrap_or_default().to_owned(),
+        picture_url,
+        target: item["target"].as_str().unwrap_or_default().trim_start_matches('/').to_owned(),
+        released,
+        explicit,
+        color,
+    })
 }
 
 fn extract_tracks_recursive(value: &Value, limit: usize) -> Vec<(String, String, String)> {

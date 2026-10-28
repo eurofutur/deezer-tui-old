@@ -18,7 +18,7 @@
 
 ## Features
 - Browse your Playlists, Favorites
-- Explore, Home feed
+- Home and Explore laid out like deezer.com (sections, covers, genres, See all, Flow)
 - Search for tracks, albums, artists, and playlists
 - Queue
 - Album Artwork support (kitty and ueberzugpp has full quality)

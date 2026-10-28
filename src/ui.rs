@@ -290,6 +290,11 @@ fn quality_label(quality: AudioQuality) -> &'static str {
 }
 
 /// A rounded, flat panel. The accent border marks the focused panel.
+/// Borderless block for content drawn inside an already framed panel.
+fn plain(p: &Palette) -> Block<'static> {
+    Block::default().style(Style::default().bg(p.bg))
+}
+
 fn panel(title: Option<&str>, active: bool, p: &Palette) -> Block<'static> {
     let border = if active { p.accent } else { p.dim };
     let mut block = Block::default()
@@ -753,6 +758,8 @@ fn render_main(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palett
 
     if app.viewing_settings {
         render_settings(f, app, content, p, main_active, hits);
+    } else if app.browse.is_some() {
+        render_browse(f, app, content, p, main_active, hits);
     } else if app.viewing_artist {
         render_artist(f, app, content, p, main_active, hits, protos);
     } else if let Some(view) = app.library_view {
@@ -766,24 +773,229 @@ fn render_main(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palett
     }
 }
 
-/// Inner text area of a header block (border + padding 2,2,1,0).
+/// Inner text area of a header block (padding 2,2,1,0).
 fn header_inner(area: Rect) -> Rect {
-    panel(None, false, &palette(Theme::Deezer, None)).padding(Padding::new(2, 2, 1, 0)).inner(area)
+    Block::default().padding(Padding::new(2, 2, 1, 0)).inner(area)
 }
 
-fn header_block(f: &mut ratatui::Frame<'_>, area: Rect, lines: Vec<Line<'static>>, p: &Palette, active: bool) {
+fn header_block(f: &mut ratatui::Frame<'_>, area: Rect, lines: Vec<Line<'static>>, p: &Palette) {
     f.render_widget(
-        Paragraph::new(lines).block(panel(None, active, p).padding(Padding::new(2, 2, 1, 0))),
+        Paragraph::new(lines).block(plain(p).padding(Padding::new(2, 2, 1, 0))),
         area,
     );
 }
 
-fn split_header_body(area: Rect, header_height: u16) -> (Rect, Rect) {
+/// Draws the single framed main panel and splits its inside into a borderless header and body.
+fn split_header_body(f: &mut ratatui::Frame<'_>, area: Rect, header_height: u16, p: &Palette, active: bool) -> (Rect, Rect) {
+    let frame = panel(None, active, p);
+    let inner = frame.inner(area);
+    f.render_widget(frame, area);
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(header_height), Constraint::Min(0)])
-        .split(area);
+        .split(inner);
     (parts[0], parts[1])
+}
+
+/// Narrowest card; the web shows about seven per row on a wide window.
+const CARD_MIN_WIDTH: u16 = 20;
+const CARD_GAP: u16 = 2;
+
+/// A web page (Home, Explore, a genre, "See all") laid out like deezer.com:
+/// stacked sections, each a carousel of cover cards (or a wrapped grid),
+/// with "See all" and ‹ › next to the section title.
+fn render_browse(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, active: bool, hits: &mut Hits) {
+    let Some(page) = app.browse.take() else { return };
+    let frame = panel(None, active, p).padding(Padding::new(2, 2, 1, 0));
+    let inner = frame.inner(area);
+    f.render_widget(frame, area);
+
+    let cols = ((inner.width + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).max(1);
+    let card_w = (inner.width + CARD_GAP) / cols - CARD_GAP;
+    let img_h = square_in_cells(Rect { x: 0, y: 0, width: card_w, height: u16::MAX / 2 }).height;
+    // Image, gap, two title lines, subtitle, release date, explicit tag.
+    let card_h = img_h + 6;
+    let tile_h = (img_h / 2).max(3);
+    app.browse_cols = cols as usize;
+    let (sel_s, sel_i) = app.browse_sel;
+    app.browse_select(sel_s, sel_i);
+
+    // Lay the page out as rows: (section, first item, y, height, heading?).
+    let mut rows: Vec<(usize, usize, u16, u16, bool)> = Vec::new();
+    let mut y = if page.path == "home" { 0 } else { 2 };
+    for (s, section) in page.sections.iter().enumerate() {
+        let h = if section.items.iter().all(|i| i.kind == "channel") { tile_h } else { card_h };
+        let starts: Vec<usize> = if section.grid {
+            (0..section.items.len()).step_by(cols as usize).collect()
+        } else {
+            vec![app.browse_offsets.get(s).copied().unwrap_or(0)]
+        };
+        for (r, first) in starts.into_iter().enumerate() {
+            let heading = r == 0;
+            let height = h + if heading { 2 } else { 0 } + 1;
+            rows.push((s, first, y, height, heading));
+            y += height;
+        }
+        y += 1;
+    }
+
+    // Scroll so the selected row (with its heading) is fully visible.
+    let cols_us = cols as usize;
+    if let Some(&(_, _, ry, rh, _)) = rows.iter().find(|(s, first, _, _, _)| {
+        *s == sel_s && (!page.sections[*s].grid || (*first..*first + cols_us).contains(&app.browse_sel.1))
+    }) {
+        if ry < app.browse_scroll {
+            app.browse_scroll = ry;
+        } else if ry + rh > app.browse_scroll + inner.height {
+            // Snap to a row start: rows cut at the top are not drawn.
+            let needed = (ry + rh).saturating_sub(inner.height);
+            app.browse_scroll = rows.iter().map(|r| r.2).find(|&y| y >= needed).unwrap_or(ry);
+        }
+        if sel_s == 0 && ry <= 2 {
+            app.browse_scroll = 0;
+        }
+    }
+    let scroll = app.browse_scroll;
+
+    if page.path != "home" && scroll == 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled(page.title.clone(), bold(p))),
+            Rect { height: 1, ..inner },
+        );
+    }
+
+    app.browse_visible.clear();
+    for &(s, first, ry, rh, heading) in &rows {
+        // Only rows that fit entirely: pixel-art covers cannot be cut.
+        if ry < scroll || ry + rh > scroll + inner.height {
+            continue;
+        }
+        let section = &page.sections[s];
+        let mut y = inner.y + ry - scroll;
+        if heading {
+            let line = Rect { x: inner.x, y, width: inner.width, height: 1 };
+            let title_w = section.title.chars().count() as u16;
+            let mut spans = vec![Span::styled(section.title.clone(), bold(p))];
+            if section.more.is_some() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(" See all ", Style::default().fg(p.fg).bg(p.surface)));
+                hit(hits, Rect { x: line.x + title_w + 2, width: 9, ..line }, Hit::BrowseMore(s));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), line);
+            if !section.grid && section.items.len() > cols_us {
+                let off = app.browse_offsets.get(s).copied().unwrap_or(0);
+                let arrow = |on: bool| if on { Style::default().fg(p.fg) } else { Style::default().fg(p.dim) };
+                let arrows = Line::from(vec![
+                    Span::styled("‹", arrow(off > 0)),
+                    Span::raw("   "),
+                    Span::styled("›", arrow(off + cols_us < section.items.len())),
+                ]);
+                let ax = line.x + line.width.saturating_sub(5);
+                f.render_widget(Paragraph::new(arrows), Rect { x: ax, width: 5, ..line });
+                hit(hits, Rect { x: ax, width: 2, ..line }, Hit::BrowseScroll { section: s, forward: false });
+                hit(hits, Rect { x: ax + 3, width: 2, ..line }, Hit::BrowseScroll { section: s, forward: true });
+            }
+            y += 2;
+        }
+        for (col, item) in section.items.iter().enumerate().skip(first).take(cols_us) {
+            let rect = Rect {
+                x: inner.x + (col - first) as u16 * (card_w + CARD_GAP),
+                y,
+                width: card_w,
+                height: rh - if heading { 3 } else { 1 },
+            };
+            let selected = active && (s, col) == app.browse_sel;
+            if let Some(url) = &item.picture_url {
+                app.browse_visible.push(url.clone());
+            }
+            let img = item.picture_url.as_ref().and_then(|u| app.images.get(u)).filter(|i| i.width() > 1);
+            if item.kind == "channel" {
+                draw_channel_tile(f, item, img, rect, selected, p);
+            } else {
+                draw_card(f, item, img, rect, img_h, selected, p);
+            }
+            hit(hits, rect, Hit::BrowseItem { section: s, item: col });
+        }
+    }
+    app.browse = Some(page);
+}
+
+/// Cover, title, subtitle, release date and EXPLICIT tag, like a web card.
+fn draw_card(
+    f: &mut ratatui::Frame<'_>,
+    item: &crate::api::BrowseItem,
+    img: Option<&DynamicImage>,
+    rect: Rect,
+    img_h: u16,
+    selected: bool,
+    p: &Palette,
+) {
+    let cover = Rect { height: img_h, ..rect };
+    match img {
+        Some(img) => render_image(f, img, cover, p.bg, item.kind == "artist"),
+        None => f.render_widget(Block::default().style(Style::default().bg(p.surface)), cover),
+    }
+    // Hover / selection: accent bar under the cover, like the web's play button.
+    if selected {
+        f.render_widget(
+            Paragraph::new("▀".repeat(rect.width as usize)).style(Style::default().fg(p.accent)),
+            Rect { y: cover.y + img_h, height: 1, ..rect },
+        );
+    }
+    let title_style = if selected { Style::default().fg(p.accent).add_modifier(Modifier::BOLD) } else { bold(p) };
+    let mut y = cover.y + img_h + 1;
+    let title_lines = if item.subtitle.is_empty() { 3 } else { 2 };
+    f.render_widget(
+        Paragraph::new(Span::styled(item.title.clone(), title_style)).wrap(Wrap { trim: true }),
+        Rect { y, height: title_lines, ..rect },
+    );
+    y += title_lines;
+    // Without a release date the subtitle ("With …", "80 tracks - …") gets two lines.
+    let sub_h = if item.released.is_empty() { 2 } else { 1 };
+    f.render_widget(
+        Paragraph::new(Span::styled(item.subtitle.clone(), muted(p))).wrap(Wrap { trim: true }),
+        Rect { y, height: sub_h.min(item.subtitle.len() as u16), ..rect },
+    );
+    y += sub_h;
+    let mut lines = Vec::new();
+    if !item.released.is_empty() {
+        lines.push(Line::from(Span::styled(format!("Released {}", item.released), muted(p))));
+    }
+    if item.explicit {
+        lines.push(Line::from(Span::styled(" EXPLICIT ", Style::default().fg(p.muted).bg(p.surface))));
+    }
+    f.render_widget(Paragraph::new(lines), Rect { y, height: (rect.y + rect.height).saturating_sub(y), ..rect });
+}
+
+/// Explore's genre / category tile: coloured block, title, picture on the right.
+fn draw_channel_tile(
+    f: &mut ratatui::Frame<'_>,
+    item: &crate::api::BrowseItem,
+    img: Option<&DynamicImage>,
+    rect: Rect,
+    selected: bool,
+    p: &Palette,
+) {
+    let bg = item.color.map(|(r, g, b)| Color::Rgb(r, g, b)).unwrap_or(p.surface);
+    let title_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let title_style = if selected { title_style.add_modifier(Modifier::UNDERLINED) } else { title_style };
+    f.render_widget(
+        Paragraph::new(Span::styled(item.title.clone(), title_style))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().style(Style::default().bg(bg)).padding(Padding::new(1, 1, 0, 0))),
+        rect,
+    );
+    if let Some(img) = img {
+        let side = square_in_cells(Rect { height: rect.height.saturating_sub(1), ..rect });
+        let pic = Rect { x: rect.x + rect.width - side.width, y: rect.y + 1, ..side };
+        render_image(f, img, pic, bg, false);
+    }
+    if selected {
+        f.render_widget(
+            Paragraph::new("▔".repeat(rect.width as usize)).style(Style::default().fg(p.accent)),
+            Rect { y: rect.y + rect.height, height: 1, ..rect },
+        );
+    }
 }
 
 fn track_row(index: Option<usize>, title: &str, artist: &str, trailing: Option<String>, p: &Palette) -> ListItem<'static> {
@@ -814,7 +1026,7 @@ fn section_row(label: &str, p: &Palette) -> ListItem<'static> {
 }
 
 fn render_settings(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, active: bool, hits: &mut Hits) {
-    let (header, body) = split_header_body(area, 5);
+    let (header, body) = split_header_body(f, area, 4, p, active);
     header_block(
         f,
         header,
@@ -823,7 +1035,6 @@ fn render_settings(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pa
             Line::from(Span::styled("Playback, quality and integrations", muted(p))),
         ],
         p,
-        active,
     );
     let on_off = |b: bool| if b { "On" } else { "Off" };
     let items = vec![
@@ -839,7 +1050,7 @@ fn render_settings(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pa
         },
     ];
     let heights = vec![1u16; items.len()];
-    let block = panel(None, false, p);
+    let block = plain(p);
     let inner = block.inner(body);
     let list = List::new(
         items
@@ -855,7 +1066,7 @@ fn render_settings(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pa
 }
 
 fn render_welcome(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, active: bool) {
-    let (header, body) = split_header_body(area, 5);
+    let (header, body) = split_header_body(f, area, 4, p, active);
     header_block(
         f,
         header,
@@ -864,7 +1075,6 @@ fn render_welcome(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pal
             Line::from(Span::styled("Pick something from the library or search Deezer", muted(p))),
         ],
         p,
-        active,
     );
     let lines = vec![
         Line::from(""),
@@ -889,15 +1099,14 @@ fn render_welcome(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pal
             muted(p),
         )),
     ];
-    f.render_widget(Paragraph::new(lines).block(panel(None, false, p)), body);
+    f.render_widget(Paragraph::new(lines).block(plain(p)), body);
 }
 
 fn render_track_list(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, active: bool, hits: &mut Hits) {
     let source = app.current_playlist_id.clone().unwrap_or_default();
-    let (title, subtitle) = if source == "__home__" {
-        ("Home".to_string(), "Recommended for you".to_string())
-    } else if source == "__explore__" {
-        ("Explore".to_string(), "Trending and discovery".to_string())
+    let (title, subtitle) = if let Some((_, name)) = app.list_title.as_ref().filter(|(sid, _)| *sid == source) {
+        let kind = if source.starts_with("__flow__:") { "Flow" } else { "Mix" };
+        (name.clone(), kind.to_string())
     } else if let Some(id) = source.strip_prefix("__album__:") {
         let name = app
             .current_album
@@ -924,7 +1133,7 @@ fn render_track_list(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &
             .unwrap_or_else(|| if source.is_empty() { "Favorite tracks".to_string() } else { "Playlist".to_string() });
         (name, "Playlist".to_string())
     };
-    let (header, body) = split_header_body(area, 5);
+    let (header, body) = split_header_body(f, area, 4, p, active);
     header_block(
         f,
         header,
@@ -933,7 +1142,6 @@ fn render_track_list(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &
             Line::from(Span::styled(format!("{subtitle} · {} tracks", app.current_tracks.len()), muted(p))),
         ],
         p,
-        active,
     );
     let mut items = vec![play_all_row("Play all", p)];
     items.extend(
@@ -943,7 +1151,7 @@ fn render_track_list(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &
             .map(|(i, (_, title, artist))| track_row(Some(i + 1), title, artist, None, p)),
     );
     let heights = vec![1u16; items.len()];
-    let block = panel(None, false, p);
+    let block = plain(p);
     let inner = block.inner(body);
     let list = List::new(items).highlight_style(row_highlight(p)).block(block);
     f.render_stateful_widget(list, body, &mut app.main_state);
@@ -972,7 +1180,7 @@ fn render_search_results(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, 
         [Span::styled(label.to_string(), style), Span::raw("    ")]
     })
     .collect();
-    let (header, body) = split_header_body(area, 6);
+    let (header, body) = split_header_body(f, area, 5, p, active);
     header_block(
         f,
         header,
@@ -990,7 +1198,6 @@ fn render_search_results(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, 
             Line::from(tabs),
         ],
         p,
-        active,
     );
     let hi = header_inner(header);
     let tab_line = Rect { y: hi.y + 2, height: 1, ..hi };
@@ -1033,12 +1240,12 @@ fn render_search_results(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, 
     };
     if items.is_empty() {
         f.render_widget(
-            Paragraph::new(" No results in this category").style(muted(p)).block(panel(None, false, p)),
+            Paragraph::new(" No results in this category").style(muted(p)).block(plain(p)),
             body,
         );
     } else {
         let heights = vec![1u16; items.len()];
-        let block = panel(None, false, p);
+        let block = plain(p);
         let inner = block.inner(body);
         let list = List::new(items).highlight_style(row_highlight(p)).block(block);
         f.render_stateful_widget(list, body, &mut app.main_state);
@@ -1057,7 +1264,7 @@ fn render_search_results(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, 
 }
 
 fn render_library(f: &mut ratatui::Frame<'_>, app: &mut App, view: LibraryView, area: Rect, p: &Palette, active: bool, hits: &mut Hits) {
-    let (header, body) = split_header_body(area, 5);
+    let (header, body) = split_header_body(f, area, 4, p, active);
     let (title, count, items): (&str, usize, Vec<ListItem>) = match view {
         LibraryView::Albums => (
             "Albums",
@@ -1097,16 +1304,15 @@ fn render_library(f: &mut ratatui::Frame<'_>, app: &mut App, view: LibraryView, 
             Line::from(Span::styled(format!("{count} in your library · Enter to open"), muted(p))),
         ],
         p,
-        active,
     );
     if items.is_empty() {
         f.render_widget(
-            Paragraph::new(" Nothing here yet").style(muted(p)).block(panel(None, false, p)),
+            Paragraph::new(" Nothing here yet").style(muted(p)).block(plain(p)),
             body,
         );
     } else {
         let heights = vec![1u16; items.len()];
-        let block = panel(None, false, p);
+        let block = plain(p);
         let inner = block.inner(body);
         let list = List::new(items).highlight_style(row_highlight(p)).block(block);
         f.render_stateful_widget(list, body, &mut app.main_state);
@@ -1116,10 +1322,10 @@ fn render_library(f: &mut ratatui::Frame<'_>, app: &mut App, view: LibraryView, 
 
 fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Palette, active: bool, hits: &mut Hits, protos: &mut Vec<ProtocolImage>) {
     let Some(page) = app.artist_page.clone() else { return };
-    let (header, body) = split_header_body(area, 14);
+    let (header, body) = split_header_body(f, area, 13, p, active);
 
     // Header: round photo on the left, name / fans / tabs on the right.
-    let header_block = panel(None, active, p);
+    let header_block = plain(p);
     let inner = header_block.inner(header);
     f.render_widget(header_block, header);
     let photo_cols = 24u16;
@@ -1197,7 +1403,7 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
             Paragraph::new(text)
                 .style(Style::default().fg(p.fg))
                 .wrap(Wrap { trim: true })
-                .block(panel(None, false, p).padding(Padding::new(2, 2, 1, 1))),
+                .block(plain(p).padding(Padding::new(2, 2, 1, 1))),
             body,
         );
         return;
@@ -1243,7 +1449,7 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
         .collect();
     if items.is_empty() {
         f.render_widget(
-            Paragraph::new(" Nothing in this tab").style(muted(p)).block(panel(None, false, p)),
+            Paragraph::new(" Nothing in this tab").style(muted(p)).block(plain(p)),
             body,
         );
     } else {
@@ -1252,7 +1458,7 @@ fn render_artist(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: &Pale
             .iter()
             .map(|r| if matches!(r, ArtistRow::Header(_)) { 2 } else { 1 })
             .collect();
-        let block = panel(None, false, p);
+        let block = plain(p);
         let inner = block.inner(body);
         let list = List::new(items).highlight_style(row_highlight(p)).block(block);
         f.render_stateful_widget(list, body, &mut app.main_state);
@@ -1354,6 +1560,8 @@ fn render_right_panel(f: &mut ratatui::Frame<'_>, app: &mut App, area: Rect, p: 
             ActivePanel::Main => {
                 if app.viewing_settings {
                     keys.extend([("Enter", "Toggle / cycle"), ("↑ ↓", "Move")]);
+                } else if app.browse.is_some() {
+                    keys.extend([("← →", "Move in row"), ("↑ ↓", "Section"), ("Enter", "Open / play"), ("Esc", "Back")]);
                 } else if app.viewing_artist {
                     keys.extend([("← →", "Switch tab"), ("Enter", "Play / open"), ("Esc", "Back")]);
                 } else if app.library_view.is_some() {
